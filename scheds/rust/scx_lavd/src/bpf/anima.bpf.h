@@ -9,23 +9,35 @@
 #include "intf.h"
 
 /*
- * AnimAIOS boost level. Out of LAVD_SCALE (=1024), this puts the focused
- * task firmly in the LC top 12.5% — equivalent to the scheduler's own
- * LAVD_LC_LATENCY_SENSITIVE_THRESH — so the focused task wins the
- * tightest-possible deadline bucket.
+ * Runtime-tunable boost level. The daemon writes this value once at startup
+ * into the `anima_config` BPF map. Default is LAVD_ANIMA_LC_BOOST_DFL (896)
+ * if the map is empty or the daemon hasn't written yet.
  *
- * Crucially, this is not UINT16_MAX (0xFFFF). Setting lat_cri above ~896
- * makes the deadline `adjusted_runtime * greedy_penalty / lat_cri` collapse
- * to sub-nanosecond territory: dl_delta rounds to zero, and whether the
+ * Valid range: 0 (disable boost) .. 1024 (=LAVD_SCALE, max sensible value).
+ * Values above ~900 start collapsing dl_delta toward zero — setting
+ * lat_cri that high divides `adjusted_runtime * greedy_penalty / lat_cri`
+ * down to sub-ns territory: dl_delta rounds to zero, and whether the
  * focused task is on-CPU or not makes no difference to everyone else.
- * That's overkill: it starves background work and clamps preemption
- * granularity. 896 gives the focused task the same priority boost that
- * LAVD's own heuristics already grant to its top-sensitivity tier — just
- * enough to win the next dispatch without wrecking the fairness accounting.
+ * That starves background work and clamps preemption granularity.
+ * 896 (=LAVD_SCALE * 7/8) puts the focused task in the same top-12.5%
+ * latency-criticality bucket as LAVD's own LAVD_LC_LATENCY_SENSITIVE_THRESH.
  */
 enum {
-	LAVD_ANIMA_LC_BOOST = (1024 * 7) / 8,  /* 896, top 12.5% LC */
+	LAVD_ANIMA_LC_BOOST_DFL = (1024 * 7) / 8,  /* 896, top 12.5% LC */
 };
+
+/*
+ * Runtime-tunable config map. The daemon writes the boost level once at
+ * startup into key 0; BPF falls back to LAVD_ANIMA_LC_BOOST_DFL if the
+ * lookup fails (e.g., scheduler booted before the daemon).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} anima_config SEC(".maps");
 
 /*
  * Map of PIDs belonging to the currently Hyprland focused window.

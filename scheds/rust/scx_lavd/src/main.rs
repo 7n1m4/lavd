@@ -515,11 +515,23 @@ impl<'a> Scheduler<'a> {
                     // multi-tenant host you'd pin under a cgroup-owned path.
                     let _ = Command::new("sh")
                         .args(["-c",
-                          "chmod 755 /sys/fs/bpf; chmod 666 /sys/fs/bpf/anima_active_pids"])
+                          "chmod 755 /sys/fs/bpf; chmod 666 /sys/fs/bpf/anima_active_pids; chmod 666 /sys/fs/bpf/anima_config"])
                         .output();
                     info!("AnimAIOS: anima_active_pids pinned @ /sys/fs/bpf/anima_active_pids");
                 }
                 Err(e) => info!("AnimAIOS: could not pin anima_active_pids: {}", e),
+            }
+        }
+
+        /*
+         * AnimAIOS: pin the runtime-tunable config map. The daemon writes
+         * the focused-window boost level into this map at startup.
+         */
+        {
+            let pin_path = PathBuf::from("/sys/fs/bpf/anima_config");
+            match skel.maps.anima_config.pin(&pin_path) {
+                Ok(()) => info!("AnimAIOS: anima_config pinned @ /sys/fs/bpf/anima_config"),
+                Err(e) => info!("AnimAIOS: could not pin anima_config: {}", e),
             }
         }
         let task_size = std::mem::size_of::<types::task_ctx>();

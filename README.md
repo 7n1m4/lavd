@@ -56,10 +56,12 @@ syscalls regardless of map size. On `SIGINT`/`SIGTERM` and on graceful
 exit the map gets cleared the same way so no stale boost survives a daemon
 stop.
 
-The kernel-side LAVD sees each PID in the map and sets `lat_cri =
-LAVD_ANIMA_LC_BOOST = 896` (LAVD's top LC bucket). The focused task
-therefore wins dispatch on the next round without collapsing the deadline
-numerator to zero.
+The kernel-side LAVD sees each PID in the map and sets `lat_cri` to the
+user-configurable boost level (default 896, LAVD's top LC bucket). The
+focused task therefore wins dispatch on the next round without collapsing
+the deadline numerator to zero. Boost level is read from the
+`anima_config` BPF map, written by the daemon at startup from the
+`ANIMA_BOOST` environment variable.
 
 ---
 
@@ -120,6 +122,22 @@ sudo systemctl enable scx_loader.service
 sudo systemctl enable anima-hypr.service
 sudo systemctl start scx_loader.service anima-hypr.service
 ```
+
+### Tuning the boost level
+
+The focused-window boost level is runtime-configurable via the
+`ANIMA_BOOST` environment variable. Default is 896 (top 12.5% LC bucket).
+Valid range: 0 (disable boost) .. 1024 (=LAVD_SCALE). Values above ~900
+start collapsing `dl_delta` toward zero — tune with care.
+
+```bash
+# Optional: tune boost at runtime (default 896, max 1024)
+ANIMA_BOOST=768 sudo -E /usr/local/bin/anima-hypr-daemon window+tree
+```
+
+To make the change permanent, edit `services/anima-hypr.service` and add
+`Environment="ANIMA_BOOST=768"` to the `[Service]` section, then
+`systemctl daemon-reload && systemctl restart anima-hypr.service`.
 
 ### Runtime
 
@@ -182,13 +200,20 @@ documentation for the full story. The很短 version:
 - On `ops.enqueue`, LAVD calls `calc_lat_cri()`. Our patch adds:
 
   ```c
-  if (is_anima_focused_pid((u32)p->pid))
-      taskc->lat_cri = LAVD_ANIMA_LC_BOOST;  /* 896, top 12.5% LC */
+  if (is_anima_focused_pid((u32)p->pid)) {
+      u32 zero = 0;
+      u32 *boost = bpf_map_lookup_elem(&anima_config, &zero);
+      taskc->lat_cri = boost ? *boost : LAVD_ANIMA_LC_BOOST_DFL;
+  }
   ```
 
-  This forces the focused task into LAVD's top LC bucket. Setting it any
-  higher (e.g. `UINT16_MAX`) divides the deadline down to sub-ns granularity
-  (`dl_delta == 0`), which makes the focused task's virtual deadline land at
+  This forces the focused task into LAVD's top LC bucket using the
+  runtime-configurable boost level. The daemon writes the boost value into
+  the `anima_config` BPF map at startup; if the lookup fails (e.g.,
+  scheduler booted before the daemon), the default `LAVD_ANIMA_LC_BOOST_DFL`
+  (= 896 = top 12.5% LC) applies. Setting the boost higher divides the
+  deadline down to sub-ns granularity (`dl_delta == 0`), which makes the
+  focused task's virtual deadline land at
   `cur_logical_CLK - LAVD_DL_COMPETE_WINDOW` — indistinguishable from any
   other starving task. That starves background work without adding useful
   priority separation. 896 (= `LAVD_SCALE * 7 / 8` = LAVD's own

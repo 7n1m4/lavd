@@ -346,12 +346,14 @@ static u64 calc_virtual_deadline_delta(struct task_struct *p,
 	calc_lat_cri(p, taskc);
 
 	/*
-	 * AnimAIOS: if this task is the Hyprland focused window,
-	 * force maximum latency criticality so it gets the tightest
-	 * possible virtual deadline.
+	 * AnimAIOS: if this task is the Hyprland focused window, apply the
+	 * user-configured latency-criticality boost (or the default if unset).
 	 */
-	if (is_anima_focused_pid((u32)p->pid))
-		taskc->lat_cri = LAVD_ANIMA_LC_BOOST;
+	if (is_anima_focused_pid((u32)p->pid)) {
+		u32 zero = 0;
+		u32 *boost = bpf_map_lookup_elem(&anima_config, &zero);
+		taskc->lat_cri = boost ? *boost : LAVD_ANIMA_LC_BOOST_DFL;
+	}
 
 	greedy_penalty = calc_greedy_penalty(p, taskc);
 	adjusted_runtime = calc_adjusted_runtime(taskc);
