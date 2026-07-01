@@ -9,164 +9,211 @@
 //! priority to `nice -10` so focus updates aren't starved by the very
 //! workloads they are meant to preempt.
 
-use serde_json;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
+use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
 const MAP_PIN_PATH: &str = "/sys/fs/bpf/anima_active_pids";
 
-// Key size for the pinned map. AnimaSchedEXT pins it as __u32 keys (PID),
-// __u8 values (active flag); this constant drives how many hex bytes we
-// emit per PID when building bpftool key args.
-const MAP_KEY_BYTES: usize = 4;
+/// Value written to the BPF map entry (`0x01` = active/focused).
+const MAP_ACTIVE_VALUE: u8 = 0x01;
 
-fn hypr_sock2() -> Result<PathBuf, String> {
-    let instance = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
-        .map_err(|_| "HYPRLAND_INSTANCE_SIGNATURE not set — is Hyprland running?")?;
-    let xdg = std::env::var("XDG_RUNTIME_DIR")
-        .map_err(|_| "XDG_RUNTIME_DIR not set")?;
-    Ok(PathBuf::from(format!(
-        "{}/hypr/{}/.socket2.sock", xdg, instance
-    )))
+/*
+ * Animamap — thin wrapper over the pinned `anima_active_pids` BPF hash map.
+ *
+ * Before commit *X*, each focus event spawned three `bpftool` subprocesses
+ * (dump → JSON parse → batch delete, then N × map update). That was ~5ms
+ * of pure subprocess init overhead per event, visible as micro-stutter on
+ * fast alt-tabbing.
+ *
+ * Now we open the pinned map once (via `MapHandle::from_pinned_path`) and
+ * mutate it directly via the bpf() syscall through `MapHandle::update` /
+ * `MapHandle::delete`. The handle keeps a ref-counted FD so libbpf holds
+ * the pin alive as long as we hold the handle.
+ *
+ * `MapHandle::from_pinned_path` does an fstat on `/sys/fs/bpf/...` and
+ * finds the pinned map by name — pinning is required (which scx_lavd
+ * already does for `anima_active_pids`). If you ever need to open an
+ * unpinned map, use `MapHandle::from_map_fd(fd)` or walk the skel.
+ */
+struct Animamap {
+    handle: MapHandle,
+    last_keys: HashSet<u32>,
 }
 
-/// Update the pinned `anima_active_pids` map: clear existing keys, then
-/// insert the focused PID (and optionally its direct children).
-///
-/// Child-walk trade-off (why `pgrep -P` — direct children only):
-///
-/// We deliberately do *not* walk the full descendant subtree. A shallow
-/// direct-children pass catches the common desktop case — toolkit workers,
-/// renderers, or nested shells immediately owned by the focused toplevel —
-/// while avoiding unrelated forks further down (e.g., a terminal forks a
-/// shell that forks a make that forks its own helpers) that would otherwise
-/// balloon the boost set with tasks that have no real coupling to the
-/// interactive session.
-fn update_map(focused_pid: u32, include_children: bool) -> Result<(), String> {
-    let mut to_insert = vec![focused_pid];
-    if include_children {
-        if let Ok(out) = Command::new("pgrep")
-            .args(["-P", &focused_pid.to_string()])
-            .output()
-        {
-            if out.status.success() {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    if let Ok(cpid) = line.trim().parse::<u32>() {
-                        to_insert.push(cpid);
+impl Animamap {
+    /// Open the pinned BPF map at `MAP_PIN_PATH`.
+    ///
+    /// `MapHandle::from_pinned_path` is the canonical entry point in
+    /// libbpf-rs 0.26.x for opening any pinned BPF map — which is exactly
+    /// what we need here. Verification: `BPF_MAP_TYPE_HASH`, key=`u32`,
+    /// value=`u8`, max_entries=16 (see `anima.bpf.h`).
+    fn open() -> Result<Self> {
+        let handle = MapHandle::from_pinned_path(MAP_PIN_PATH)
+            .with_context(|| format!("failed to open pinned BPF map at {}", MAP_PIN_PATH))?;
+
+        Ok(Self {
+            handle,
+            last_keys: HashSet::new(),
+        })
+    }
+
+    /// Push the focused PID (and optionally its direct children) into the
+    /// map. Incrementally updates: only removes stale keys + inserts new
+    /// keys. No subprocess, no temp file, no JSON parsing.
+    fn update_focused(&mut self, focused_pid: u32, include_children: bool) -> Result<()> {
+        let mut new_keys: HashSet<u32> = HashSet::with_capacity(8);
+
+        new_keys.insert(focused_pid);
+
+        if include_children {
+            match std::process::Command::new("pgrep")
+                .args(["-P", &focused_pid.to_string()])
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        if let Ok(cpid) = line.trim().parse::<u32>() {
+                            new_keys.insert(cpid);
+                        }
+                    }
+                }
+                Ok(_) => {} /* pgrep exited with no matches — not an error */
+                Err(e) => eprintln!("[anima] pgrep failed: {}", e),
+            }
+        }
+
+        // Delete stale keys (present in last round but not in new set).
+        for stale_key in self.last_keys.difference(&new_keys) {
+            let key_bytes = stale_key.to_le_bytes();
+            if let Err(e) = self.handle.delete(&key_bytes) {
+                eprintln!("[anima] bpf delete warning for pid {}: {}", stale_key, e);
+            }
+        }
+
+        // Insert new keys.
+        let inserted_count = new_keys.len();
+        for key in &new_keys {
+            let key_bytes = key.to_le_bytes();
+            if let Err(e) = self.handle.update(&key_bytes, &[MAP_ACTIVE_VALUE], MapFlags::ANY) {
+                return Err(anyhow::anyhow!(
+                    "bpf update failed for pid {}: {}",
+                    key,
+                    e
+                ));
+            }
+        }
+
+        self.last_keys = new_keys;
+
+        eprintln!(
+            "[anima] focused -> {} ({} children)",
+            focused_pid,
+            inserted_count - 1
+        );
+        Ok(())
+    }
+
+    /// Clear every entry in the pinned map — call on SIGINT/SIGTERM so we
+    /// don't leave stale PIDs boosting after exit.
+    fn clear(&mut self) -> Result<()> {
+        // Collect keys first to avoid concurrent-modification issues.
+        let keys: Vec<Vec<u8>> = self.handle.keys().collect();
+        for key in &keys {
+            if key.len() == 4 {
+                if let Err(e) = self.handle.delete(key) {
+                    eprintln!("[anima] bpf clear: delete failed: {}", e);
+                }
+            } else {
+                eprintln!("[anima] bpf clear: unexpected key size {}", key.len());
+            }
+        }
+        self.last_keys.clear();
+        Ok(())
+    }
+}
+
+/// Build an address → PID cache from `hyprctl clients -j`. Falls back to
+/// per-event `hyprctl activewindow -j` lookups if address isn't in cache
+/// (e.g., window opened after daemon started).
+fn build_pid_cache() -> Result<HashMap<u64, u32>> {
+    let out = std::process::Command::new("hyprctl").args(["clients", "-j"]).output()
+        .context("failed to exec hyprctl clients")?;
+    if !out.status.success() {
+        return Ok(HashMap::new());
+    }
+    let json: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout)
+        .context("failed to parse hyprctl clients JSON")?;
+    let mut cache = HashMap::with_capacity(json.len());
+    for entry in json {
+        let addr = entry["address"].as_str().and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+        let pid  = entry["pid"].as_u64().map(|p| p as u32);
+        if let (Some(addr), Some(pid @ 1..)) = (addr, pid) {
+            cache.insert(addr, pid);
+        }
+    }
+    Ok(cache)
+}
+
+/// Resolve PID for a Hyprland window address via cache hit or fallback
+/// hyprctl activewindow JSON lookup. Filters out PID 0 (the kernel
+/// scheduler) which would otherwise get boosted into oblivion.
+fn lookup_pid(addr: u64, cache: &mut HashMap<u64, u32>) -> Option<u32> {
+    if let Some(pid) = cache.get(&addr).copied() {
+        return Some(pid);
+    }
+    if let Ok(out) = std::process::Command::new("hyprctl").args(["activewindow", "-j"]).output() {
+        if out.status.success() {
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                if let Some(pid) = json["pid"].as_u64().map(|p| p as u32) {
+                    if pid != 0 {
+                        cache.insert(addr, pid);
+                        return Some(pid);
+                    } else {
+                        eprintln!("[anima] hyprctl returned pid=0 — skipping");
                     }
                 }
             }
         }
     }
-
-    // 1. Dump keys from the pinned map via bpftool and delete each.
-    let dump = Command::new("bpftool")
-        .args(["-j", "map", "dump", "pinned", MAP_PIN_PATH])
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("bpftool map dump failed: {}", e);
-            std::process::exit(1);
-        });
-    if dump.status.success() {
-        let s = String::from_utf8_lossy(&dump.stdout);
-        if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&s.as_ref()) {
-            let mut del_contents = String::new();
-            for entry in parsed {
-                if let Some(arr) = entry["key"].as_array() {
-                    let bytes: Vec<String> = arr.iter().filter_map(|v| v.as_str())
-                        .map(|s| s.trim_start_matches("0x").to_string())
-                        .collect();
-                    if bytes.len() == MAP_KEY_BYTES {
-                        del_contents.push_str(&format!(
-                            "map delete pinned {} key {} {} {} {}\n",
-                            MAP_PIN_PATH, bytes[0], bytes[1], bytes[2], bytes[3]));
-                    }
-                }
-            }
-            std::fs::write("/tmp/anima_delete_batch.txt", del_contents).ok();
-            let _ = Command::new("bpftool")
-                .args(["batch", "file", "/tmp/anima_delete_batch.txt"])
-                .output();
-        }
-    }
-
-    // 2. Insert each focused PID.
-    let inserted = to_insert.len();
-    // Try direct `bpftool map update` first — newer bpftool versions handle
-    // this correctly and it's faster (no batch file I/O, no bpftool
-    // subprocess with its own init overhead for each iteration). Fall back
-    // to the batch-file path only on failure, since bpftool v7 has buggy
-    // CLI parsing for map update key/value args.
-    let mut direct_ok = true;
-    for pid in &to_insert {
-        let b = pid.to_ne_bytes();
-        let status = Command::new("bpftool")
-            .args([
-                "map", "update", "pinned", MAP_PIN_PATH,
-                "key",
-                &format!("{:02x}", b[0]),
-                &format!("{:02x}", b[1]),
-                &format!("{:02x}", b[2]),
-                &format!("{:02x}", b[3]),
-                "value", "01", "any",
-            ])
-            .output();
-        match status {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => {
-                eprintln!(
-                    "[anima] direct bpftool map update failed for PID {}: {}",
-                    pid,
-                    String::from_utf8_lossy(&out.stderr),
-                );
-                direct_ok = false;
-                break;
-            }
-            Err(e) => {
-                eprintln!("[anima] bpftool map update exec error: {}", e);
-                direct_ok = false;
-                break;
-            }
-        }
-    }
-
-    if !direct_ok {
-        // Fallback: batch-file path works around bpftool v7 CLI parsing bugs.
-        let mut contents = String::new();
-        for pid in &to_insert {
-            let b = pid.to_ne_bytes();
-            contents.push_str(&format!(
-                "map update pinned {} key {:02x} {:02x} {:02x} {:02x} value 01 any\n",
-                MAP_PIN_PATH, b[0], b[1], b[2], b[3],
-            ));
-        }
-        std::fs::write("/tmp/anima_batch_cmds.txt", contents)
-            .map_err(|e| format!("batch write failed: {}", e))?;
-        let status = Command::new("bpftool")
-            .args(["batch", "file", "/tmp/anima_batch_cmds.txt"])
-            .output();
-        if let Err(e) = status {
-            eprintln!("bpftool batch failed: {}", e);
-        }
-    }
-
-    eprintln!("[anima] focused -> {focused_pid} ({} children)", inserted - 1);
-    Ok(())
+    None
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("window");
     let include_children = mode == "window+tree";
 
-    let ev_sock = hypr_sock2().unwrap_or_else(|e| {
-        eprintln!("Anima error: {}", e);
-        std::process::exit(1);
-    });
+    let ev_sock = hypr_sock2()
+        .map_err(|e| anyhow::anyhow!("Anima error: {}", e))?;
 
-    eprintln!("Anima: connecting to {}", ev_sock.display());
+    // Open the pinned BPF map BEFORE entering the event loop so a broken
+    // pin fails fast instead of silently losing updates.
+    let anima = Arc::new(Mutex::new(Animamap::open()
+        .with_context(|| "Cannot open anima_active_pids — is scx_lavd loaded and pinning the map?")?));
+
+    let mut pid_cache = build_pid_cache()
+        .inspect_err(|e| eprintln!("[anima] address cache build failed: {}", e))
+        .unwrap_or_default();
+    eprintln!("[anima] address cache: {} entries", pid_cache.len());
+
+    // Install SIGINT/SIGTERM handler so we leave the map clean on exit.
+    // The Mutex only briefly locks (syscall to bpf()), and the signal
+    // handler only runs off the main thread — no deadlock risk.
+    let anima_signal = Arc::clone(&anima);
+    ctrlc::set_handler(move || {
+        eprintln!("[anima] received shutdown signal — clearing pinned map");
+        if let Ok(mut guard) = anima_signal.lock() {
+            let _ = guard.clear();
+        }
+        std::process::exit(0);
+    })
+    .expect("failed to install ctrl-c handler");
 
     /*
      * Subscribe on the command channel (.socket.sock) and keep it open.
@@ -175,24 +222,14 @@ fn main() {
      * the duration of the run.
      */
     let cmd_sock_path = ev_sock.with_file_name(".socket.sock");
-    let mut subscribe_sock = match UnixStream::connect(&cmd_sock_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Anima error connecting to Hyprland command socket: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let mut subscribe_sock = UnixStream::connect(&cmd_sock_path)
+        .map_err(|e| anyhow::anyhow!("Anima error connecting to Hyprland command socket: {}", e))?;
     subscribe_sock
         .write_all(b"/subscribeevent activewindowv2\n")
         .expect("write subscribe command");
     subscribe_sock.flush().expect("flush subscribe command");
-    let reader_sock = match UnixStream::connect(&ev_sock) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Anima error connecting to event channel: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let reader_sock = UnixStream::connect(&ev_sock)
+        .map_err(|e| anyhow::anyhow!("Anima error connecting to event channel: {}", e))?;
     let reader = BufReader::new(reader_sock);
     for line in reader.lines() {
         let line = match line {
@@ -200,22 +237,38 @@ fn main() {
             Err(_) => break,
         };
         if line.starts_with("activewindowv2>>") {
-            // hyprland no longer sends PID in these events directly —
-            // resolve it via hyprctl's `activewindow -j` JSON.
-            if let Ok(out) = Command::new("hyprctl").args(["activewindow", "-j"]).output() {
-                if out.status.success() {
-                    match serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                        Ok(json) => {
-                            if let Some(pid) = json["pid"].as_u64() {
-                                let _ = update_map(pid as u32, include_children);
-                            }
-                        }
-                        Err(e) => eprintln!("Anima: failed to parse activewindow JSON: {}", e),
-                    }
-                }
+            let addr_str = &line["activewindowv2>>".len()..];
+            let addr = match u64::from_str_radix(addr_str.trim_start_matches("0x"), 16) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let Some(pid) = lookup_pid(addr, &mut pid_cache) else {
+                continue;
+            };
+            if let Err(e) = anima.lock()
+                .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?
+                .update_focused(pid, include_children)
+            {
+                eprintln!("[anima] update_focused error: {}", e);
             }
         }
     }
 
+    // Clean shutdown — clear the map on graceful SIGINT-free exit.
+    if let Ok(mut guard) = anima.lock() {
+        guard.clear()?;
+    }
+
     drop(subscribe_sock);
+    Ok(())
+}
+
+fn hypr_sock2() -> Result<PathBuf> {
+    let instance = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .map_err(|_| anyhow::anyhow!("HYPRLAND_INSTANCE_SIGNATURE not set — is Hyprland running?"))?;
+    let xdg = std::env::var("XDG_RUNTIME_DIR")
+        .map_err(|_| anyhow::anyhow!("XDG_RUNTIME_DIR not set"))?;
+    Ok(PathBuf::from(format!(
+        "{}/hypr/{}/.socket2.sock", xdg, instance
+    )))
 }

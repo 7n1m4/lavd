@@ -51,9 +51,10 @@ When the focused PID changes, the bpftool batch script:
 3. Inserts the new focused PID (with `window+tree`, also its direct
    children).
 
-The kernel-side LAVD then sees the PID in the map and gives it
-`lat_cri = UINT16_MAX` — which makes its virtual deadline so tight the
-scheduler will pick it first among all runnable tasks.
+The kernel-side LAVD then sees the PID in the map and tags it with
+`LAVD_ANIMA_LC_BOOST` (896 out of 1024) — LAVD's own top LC bucket —
+which makes the scheduler's deadline calculation place it in the most
+urgent tier without collapsing the remaining `dl_delta` to zero.
 
 ---
 
@@ -177,12 +178,17 @@ documentation for the full story. The很短 version:
 
   ```c
   if (is_anima_focused_pid((u32)p->pid))
-      taskc->lat_cri = UINT16_MAX;
+      taskc->lat_cri = LAVD_ANIMA_LC_BOOST;  /* 896, top 12.5% LC */
   ```
 
-  This forces the focused task into the highest LC bucket, which makes its
-  deadline `adjusted_runtime * greedy_penalty / UINT16_MAX` — essentially zero,
-  so LAVD cannot pick anything else while it is runnable.
+  This forces the focused task into LAVD's top LC bucket. Setting it any
+  higher (e.g. `UINT16_MAX`) divides the deadline down to sub-ns granularity
+  (`dl_delta == 0`), which makes the focused task's virtual deadline land at
+  `cur_logical_CLK - LAVD_DL_COMPETE_WINDOW` — indistinguishable from any
+  other starving task. That starves background work without adding useful
+  priority separation. 896 (= `LAVD_SCALE * 7 / 8` = LAVD's own
+  `LAVD_LC_LATENCY_SENSITIVE_THRESH`) is enough to guarantee dispatch win
+  on the next round without collapsing the deadline to zero.
 
 Caveat: preemption is cooperative. If the focused task is blocked, normal
 LAVD rules apply to everything else. The boost only affects runnable PIDs, and

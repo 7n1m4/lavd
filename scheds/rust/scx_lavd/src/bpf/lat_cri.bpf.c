@@ -351,7 +351,7 @@ static u64 calc_virtual_deadline_delta(struct task_struct *p,
 	 * possible virtual deadline.
 	 */
 	if (is_anima_focused_pid((u32)p->pid))
-		taskc->lat_cri = 0xFFFF;
+		taskc->lat_cri = LAVD_ANIMA_LC_BOOST;
 
 	greedy_penalty = calc_greedy_penalty(p, taskc);
 	adjusted_runtime = calc_adjusted_runtime(taskc);
