@@ -28,10 +28,10 @@ in your window manager*.
 
 ```mermaid
 graph TD
-    H[Hyprland] -->|focus event| D[hypr-daemon]
-    D -->|bpftool batch| M[pinned BPF map]
-    M -->|PID lookup| S[scx_lavd-anima]
-    S -->|lat crit max| K[LAVD kernel]
+    H["Hyprland compositor"] --> |event| D["hypr-daemon"]
+    D --> |bpf_syscall| M["pinned BPF map"]
+    M --> |lookup| S["scx_lavd-anima"]
+    S --> |priority| K["LAVD kernel"]
 ```
 
 Two moving parts:
@@ -40,21 +40,26 @@ Two moving parts:
   `anima_active_pids` BPF map at `/sys/fs/bpf/anima_active_pids`. Loaded in
   place of the usual `scx_lavd` by `scx_loader`.
 - **`anima-hypr-daemon`** — a standalone binary that you run as a systemd
-  user service alongside `scx_loader`. It watches Hyprland focus events and
-  writes the focused PID into the pinned map via `bpftool`.
+  service alongside `scx_loader`. It watches Hyprland focus events and
+  writes the focused PID into the pinned map via direct `bpf()` syscalls
+  through `libbpf_rs`.
 
-When the focused PID changes, the bpftool batch script:
+On start, the daemon reads `hyprctl clients -j` once and caches
+`address → PID`. Each focus event is resolved from that cache (with a
+fallback `hyprctl activewindow -j` for windows opened after daemon start).
 
-1. Reads every existing key from the pinned map via `bpftool -j map dump
-   pinned /sys/fs/bpf/anima_active_pids`.
-2. Deletes them with `bpftool batch file`.
-3. Inserts the new focused PID (with `window+tree`, also its direct
-   children).
+The new PID list is then applied directly to the pinned BPF map via
+`libbpf_rs::MapHandle::update` / `delete` — no `bpftool` subprocess, no
+JSON parsing, no temp file. Updates are *incremental*: only stale keys are
+deleted and only new keys inserted, so each focus change costs O(delta)
+syscalls regardless of map size. On `SIGINT`/`SIGTERM` and on graceful
+exit the map gets cleared the same way so no stale boost survives a daemon
+stop.
 
-The kernel-side LAVD then sees the PID in the map and tags it with
-`LAVD_ANIMA_LC_BOOST` (896 out of 1024) — LAVD's own top LC bucket —
-which makes the scheduler's deadline calculation place it in the most
-urgent tier without collapsing the remaining `dl_delta` to zero.
+The kernel-side LAVD sees each PID in the map and sets `lat_cri =
+LAVD_ANIMA_LC_BOOST = 896` (LAVD's top LC bucket). The focused task
+therefore wins dispatch on the next round without collapsing the deadline
+numerator to zero.
 
 ---
 
@@ -135,8 +140,8 @@ When `anima-hypr-daemon` is running, watch the focus updates:
 
 ```bash
 $ journalctl -u anima-hypr.service -f
-[fanima] focused -> 2356175 (with 0 children)
-[fanima] focused -> 2356843 (with 0 children)
+[anima] focused -> 2356175 (with 0 children)
+[anima] focused -> 2356843 (with 0 children)
 ```
 
 And verify the kernel saw the boost:
