@@ -18,8 +18,8 @@
 //! - Signal handlers so the pinned map is wiped on exit/crash/SIGTERM
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -115,6 +115,38 @@ impl Animamap {
         self.config_handle
             .update(&0u32.to_le_bytes(), &clamped.to_le_bytes(), MapFlags::ANY)
             .with_context(|| format!("failed to update anima_config[{clamped}]"))?;
+        Ok(())
+    }
+
+    /// Browser-mode update: boost only the focused PID and the PID of the
+    /// active browser tab reported by the WebExtension. Skips the
+    /// children-of-focused-pid walk entirely (useless for browsers). Falls
+    /// back to `update_focused` when mode is inactive or no tab-PID has
+    /// been seen yet.
+    fn update_browser(&mut self, focused_pid: u32, tab_pid: u32) -> Result<()> {
+        let mut new_keys = HashSet::with_capacity(2);
+        new_keys.insert(focused_pid);
+        new_keys.insert(tab_pid);
+
+        // Delete stale keys.
+        for stale in self.last_keys.difference(&new_keys) {
+            if let Err(e) = self.handle.delete(&stale.to_le_bytes()) {
+                eprintln!("[anima] delete pid {stale}: {e}");
+            }
+        }
+
+        // Insert new keys.
+        for &key in &new_keys {
+            if let Err(e) = self
+                .handle
+                .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
+            {
+                return Err(anyhow::anyhow!("insert pid {key}: {e}"));
+            }
+        }
+
+        self.last_keys = new_keys;
+        eprintln!("[anima] browser mode -> focused {focused_pid}, tab {tab_pid}");
         Ok(())
     }
 
@@ -298,6 +330,13 @@ fn direct_children(parent: u32) -> Result<Vec<u32>> {
     Ok(out)
 }
 
+/// Read the comm (command name) for a PID. Returns `None` if the
+/// process has already exited or `/proc/<pid>/comm` is unreadable.
+fn read_comm(pid: u32) -> Option<String> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(s.trim().to_string())
+}
+
 /// Build an address → PID lookup table from `hyprctl clients -j`.
 fn build_pid_cache() -> Result<HashMap<u64, u32>> {
     let out = std::process::Command::new("hyprctl")
@@ -385,6 +424,47 @@ fn main() -> Result<()> {
         }
     }
 
+    /* Browser-mode state: the active-tab PID reported by the WebExtension
+     * via a UNIX stream socket at `/run/anima/tab.sock`. The PID is
+     * retrieved by the extension for the currently-focused tab and sent
+     * as 4 native-endian bytes each time the tab changes. */
+    let browser_cmds: Vec<String> = std::env::var("ANIMA_BROWSER_CMDS")
+        .unwrap_or_else(|_| "floorp,floorp-bin,librewolf,firefox,firefox-bin".into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    eprintln!("[anima] browser mode commands: {:?}", browser_cmds);
+
+    let active_tab_pid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let active_tab_pid_for_thread = Arc::clone(&active_tab_pid);
+    std::thread::spawn(move || {
+        let sock_path = "/run/anima/tab.sock";
+        let _ = std::fs::remove_file(sock_path); /* ignore NotFound */
+        let Ok(listener) = UnixListener::bind(sock_path) else {
+            eprintln!("[anima] tab-pid listener: cannot bind {sock_path}");
+            return;
+        };
+        eprintln!("[anima] tab-pid listener bound on {sock_path}");
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else {
+                break;
+            };
+            let mut buf = [0u8; 4];
+            loop {
+                match s.read_exact(&mut buf) {
+                    Ok(()) => {
+                        let pid = i32::from_ne_bytes(buf);
+                        if pid > 0 {
+                            *active_tab_pid_for_thread.lock().unwrap() = Some(pid as u32);
+                        }
+                    }
+                    Err(_) => break, /* writer disconnected */
+                }
+            }
+        }
+    });
+
     let mut pid_cache = build_pid_cache()
         .inspect_err(|e| eprintln!("[anima] cache build failed: {e}"))
         .unwrap_or_default();
@@ -423,8 +503,21 @@ fn main() -> Result<()> {
         let Some(pid) = lookup_pid(addr, &mut pid_cache) else {
             continue;
         };
+
+        /* Focus-mode detection: is the focused window a known browser, and
+         * do we have an active-tab PID to switch to? */
+        let tab_pid = *active_tab_pid.lock().unwrap();
+        let is_browser = read_comm(pid)
+            .map(|c| browser_cmds.contains(&c))
+            .unwrap_or(false);
+
         let mut g = anima.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        if let Err(e) = g.update_focused(pid, include_children) {
+        if is_browser && tab_pid.is_some() {
+            let tp = tab_pid.unwrap();
+            if let Err(e) = g.update_browser(pid, tp) {
+                eprintln!("[anima] update_browser: {e}");
+            }
+        } else if let Err(e) = g.update_focused(pid, include_children) {
             eprintln!("[anima] update_focused: {e}");
         }
     }
