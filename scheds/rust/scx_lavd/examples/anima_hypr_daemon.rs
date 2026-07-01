@@ -16,7 +16,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const MAP_PIN_PATH: &str = "/sys/fs/bpf/anima_active_pids";
-const MAP_PIN_DIR: &str = "/sys/fs/bpf";
+
+// Key size for the pinned map. AnimaSchedEXT pins it as __u32 keys (PID),
+// __u8 values (active flag); this constant drives how many hex bytes we
+// emit per PID when building bpftool key args.
+const MAP_KEY_BYTES: usize = 4;
 
 fn hypr_sock2() -> Result<PathBuf, String> {
     let instance = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
@@ -30,6 +34,16 @@ fn hypr_sock2() -> Result<PathBuf, String> {
 
 /// Update the pinned `anima_active_pids` map: clear existing keys, then
 /// insert the focused PID (and optionally its direct children).
+///
+/// Child-walk trade-off (why `pgrep -P` — direct children only):
+///
+/// We deliberately do *not* walk the full descendant subtree. A shallow
+/// direct-children pass catches the common desktop case — toolkit workers,
+/// renderers, or nested shells immediately owned by the focused toplevel —
+/// while avoiding unrelated forks further down (e.g., a terminal forks a
+/// shell that forks a make that forks its own helpers) that would otherwise
+/// balloon the boost set with tasks that have no real coupling to the
+/// interactive session.
 fn update_map(focused_pid: u32, include_children: bool) -> Result<(), String> {
     let mut to_insert = vec![focused_pid];
     if include_children {
@@ -64,7 +78,7 @@ fn update_map(focused_pid: u32, include_children: bool) -> Result<(), String> {
                     let bytes: Vec<String> = arr.iter().filter_map(|v| v.as_str())
                         .map(|s| s.trim_start_matches("0x").to_string())
                         .collect();
-                    if bytes.len() == 4 {
+                    if bytes.len() == MAP_KEY_BYTES {
                         del_contents.push_str(&format!(
                             "map delete pinned {} key {} {} {} {}\n",
                             MAP_PIN_PATH, bytes[0], bytes[1], bytes[2], bytes[3]));
@@ -80,23 +94,62 @@ fn update_map(focused_pid: u32, include_children: bool) -> Result<(), String> {
 
     // 2. Insert each focused PID.
     let inserted = to_insert.len();
-    // Build batch commands for bpftool. bpftool v7 CLI parsing is buggy for
-    // map update key/value pairs, but `bpftool batch file` handles the same
-    // syntax correctly. We batch all the updates into a single file.
-    let mut contents = String::new();
+    // Try direct `bpftool map update` first — newer bpftool versions handle
+    // this correctly and it's faster (no batch file I/O, no bpftool
+    // subprocess with its own init overhead for each iteration). Fall back
+    // to the batch-file path only on failure, since bpftool v7 has buggy
+    // CLI parsing for map update key/value args.
+    let mut direct_ok = true;
     for pid in &to_insert {
         let b = pid.to_ne_bytes();
-        contents.push_str(&format!(
-            "map update pinned {} key {:02x} {:02x} {:02x} {:02x} value 01 any\n",
-            MAP_PIN_PATH, b[0], b[1], b[2], b[3],
-        ));
+        let status = Command::new("bpftool")
+            .args([
+                "map", "update", "pinned", MAP_PIN_PATH,
+                "key",
+                &format!("{:02x}", b[0]),
+                &format!("{:02x}", b[1]),
+                &format!("{:02x}", b[2]),
+                &format!("{:02x}", b[3]),
+                "value", "01", "any",
+            ])
+            .output();
+        match status {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                eprintln!(
+                    "[anima] direct bpftool map update failed for PID {}: {}",
+                    pid,
+                    String::from_utf8_lossy(&out.stderr),
+                );
+                direct_ok = false;
+                break;
+            }
+            Err(e) => {
+                eprintln!("[anima] bpftool map update exec error: {}", e);
+                direct_ok = false;
+                break;
+            }
+        }
     }
-    std::fs::write("/tmp/anima_batch_cmds.txt", contents).map_err(|e| format!("batch write failed: {}", e))?;
-    let status = Command::new("bpftool")
-        .args(["batch", "file", "/tmp/anima_batch_cmds.txt"])
-        .output();
-    if let Err(e) = status {
-        eprintln!("bpftool batch failed: {}", e);
+
+    if !direct_ok {
+        // Fallback: batch-file path works around bpftool v7 CLI parsing bugs.
+        let mut contents = String::new();
+        for pid in &to_insert {
+            let b = pid.to_ne_bytes();
+            contents.push_str(&format!(
+                "map update pinned {} key {:02x} {:02x} {:02x} {:02x} value 01 any\n",
+                MAP_PIN_PATH, b[0], b[1], b[2], b[3],
+            ));
+        }
+        std::fs::write("/tmp/anima_batch_cmds.txt", contents)
+            .map_err(|e| format!("batch write failed: {}", e))?;
+        let status = Command::new("bpftool")
+            .args(["batch", "file", "/tmp/anima_batch_cmds.txt"])
+            .output();
+        if let Err(e) = status {
+            eprintln!("bpftool batch failed: {}", e);
+        }
     }
 
     eprintln!("[anima] focused -> {focused_pid} ({} children)", inserted - 1);
