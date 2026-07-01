@@ -1,4 +1,8 @@
-# AnimaSchedEXT
+<div align=center>
+
+# [Anima](https://github.com/animaios/anima)SchedEXT
+
+<img width="256" height="384" alt="AnimAIOS mascot" src="https://github.com/user-attachments/assets/6d6699ed-e61b-4e8a-8148-6d9ab4b36cef" />
 
 [![ sched_ext](https://img.shields.io/badge/sched_ext-BPF_scheduler-orange)](https://github.com/sched-ext/scx)
 [![ Hyprland](https://img.shields.io/badge/Hyprland-aware-blueviolet)](https://hyprland.org)
@@ -15,6 +19,8 @@ under load: it classifies tasks by communication behavior and gives the most
 urgent, latency-sensitive ones the tightest virtual deadlines. AnimaSchedEXT
 adds one piece it was missing — awareness of which window is *actually focused
 in your window manager*.
+
+</div>
 
 ---
 
