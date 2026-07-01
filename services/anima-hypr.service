@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Anima Hyprland focus daemon for scx_lavd
+#
+# Subscribes to Hyprland's activewindowv2 events and pushes the focused
+# PID into scx_lavd's pinned anima_active_pids BPF map. LAVD then gives
+# that PID the tightest virtual deadline (see patch in
+# scheds/rust/scx_lavd/src/bpf/anima.bpf.h).
+#
+# Must run as root (or CAP_BPF) to update the pinned map.
+# Install:
+#   sudo install -Dm644 anima-hypr.service /etc/systemd/system/
+#   sudo install -Dm755 target/release/examples/anima_hypr_daemon /usr/local/bin/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable anima-hypr.service
+
+[Unit]
+Description=AnimAIOS Hyprland focus daemon
+After=scx_loader.service
+Requires=scx_loader.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/anima-hypr-daemon window
+ExecStop=/usr/local/bin/anima-hypr-daemon window
+Restart=on-failure
+RestartSec=3
+User=root
+AmbientCapabilities=CAP_BPF CAP_SYS_ADMIN
+
+[Install]
+WantedBy=multi-user.target

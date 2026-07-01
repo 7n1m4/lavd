@@ -1,0 +1,24 @@
+libbpf/
+*.gitignore
+PKGBUILD
+target
+build/
+# Don't ship our local backup of the patcher's install
+*.bak
+*.swp
+.cache/
+.vscode/
+tags
+*.o
+*.skel.h
+selftest
+selftest_noasan
+CLAUDE.md
+# Local DA working artifacts
+/tmp/anima_batch_cmds.txt
+**/.claude
+**/*.ll
+**/*.s
+**/*.tmp
+.agent/
+.agents/
