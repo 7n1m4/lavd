@@ -139,6 +139,25 @@ To make the change permanent, edit `services/anima-hypr.service` and add
 `Environment="ANIMA_BOOST=768"` to the `[Service]` section, then
 `systemctl daemon-reload && systemctl restart anima-hypr.service`.
 
+### Filtering heavy children (window+tree mode)
+
+By default, `window+tree` boosts the focused PID plus its direct
+children. Some of those children are background compute (a compiler
+spawned from a terminal, a video encoder, the compile farm inside an
+IDE) — exactly what LAVD is meant to de-prioritize.
+
+The daemon samples each child's `/proc/<pid>/stat` for one second, two
+samples apart, and drops any child whose CPU fraction during the
+sampling window exceeded `ANIMA_CHILD_MAX_CPU` (default 0.5 = half a
+core). Set it to 1.0 to disable filtering entirely.
+
+```bash
+# Only boost children using <30% of a core on average
+ANIMA_CHILD_MAX_CPU=0.3 sudo -E /usr/local/bin/anima-hypr-daemon window+tree
+```
+
+The same environment variable is respected via systemd `Environment=`.
+
 ### Runtime
 
 To switch between `scx_lavd` and `scx_lavd-anima` on a running system:
