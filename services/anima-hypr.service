@@ -21,6 +21,12 @@ Requires=scx_loader.service
 
 [Service]
 Type=simple
+# window: boost only the focused PID. This is the right default because
+# many GUI apps (terminals, IDEs, container tools) fork children that are
+# *background* compute — exactly what LAVD is meant to de-prioritize. If you
+# find the focused window still feels sluggish under load, switch to
+# window+tree, but note that this will also boost any compiler/encoder/etc.
+# running inside that window (see `pgrep -P` in `update_map`).
 ExecStart=/usr/local/bin/anima-hypr-daemon window
 ExecStop=/usr/local/bin/anima-hypr-daemon window
 Restart=on-failure

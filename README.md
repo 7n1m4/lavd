@@ -21,11 +21,11 @@ in your window manager*.
 ## How it works
 
 ```mermaid
-flowchart TD
-    H["Hyprland compositor"] -->|"activewindowv2 events"| D["anima-hypr-daemon"]
-    D -.->"subscribes via .socket.sock<br/>reads events via .socket2.sock<br/>resolves PID via hyprctl<br/>updates BPF map via bpftool"
-    D -->|"bpftool batch file<br/>update pinned anima_active_pids"| S["scx_lavd-anima"]
-    S -.->"LAVD ops.enqueue → is_anima_focused_pid(pid)<br/>if focused: lat_cri = UINT16_MAX"
+graph TD
+    H[Hyprland] -->|focus event| D[hypr-daemon]
+    D -->|bpftool batch| M[pinned BPF map]
+    M -->|PID lookup| S[scx_lavd-anima]
+    S -->|lat crit max| K[LAVD kernel]
 ```
 
 Two moving parts:
@@ -145,11 +145,8 @@ key: 0x0023 f9 6f (value 0x01)   # whatever the focused PID is
 
 Edit `services/anima-hypr.service`:
 
-- `ExecStart=/usr/local/bin/anima-hypr-daemon window` — boost only the focused
-  window's PID.
-- `ExecStart=/usr/local/bin/anima-hypr-daemon window+tree` — also boost direct
-  children of the focused PID (covers things like nested shells or GUI
-  toolkits that fork workers tied to a single toplevel).
+- `ExecStart=/usr/local/bin/anima-hypr-daemon window` — boost only the focused window's PID. This is the right default because many GUI apps (terminals, IDEs, etc.) fork children that are background compute — exactly what LAVD is meant to de-prioritize.
+- `ExecStart=/usr/local/bin/anima-hypr-daemon window+tree` — also boost direct children of the focused PID. Useful when the focused window forks a renderer/helper process you want kept snappy, but be aware: this will also boost a compiler or encoder running inside. Direct children only, never a deep tree walk.
 
 The stock `scx_lavd` flags still apply to `scx_lavd-anima` — see the upstream
 scx_lavd help. The drop-in `anima-scx-loader.conf` currently sets
