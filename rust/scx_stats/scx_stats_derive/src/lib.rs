@@ -27,7 +27,7 @@ pub fn stat(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
                     let assert = quote_spanned! {path.span()=>
                           struct #assert_id where #path: scx_stats::Meta;
                     };
-                    output.extend(assert.into_iter());
+                    output.extend(assert);
                 }
             }
         }

@@ -102,9 +102,8 @@ impl CpuOrder {
         let cpus_pf = ctx.build_topo_order(false).unwrap();
         let cpus_ps = ctx.build_topo_order(true).unwrap();
         let cpdom_map = CpuOrderCtx::build_cpdom(&cpus_pf).unwrap();
-        let perf_cpu_order = if ctx.em.is_ok() {
-            let em = ctx.em.unwrap();
-            EnergyModelOptimizer::get_perf_cpu_order_table(&em, &cpus_pf)
+        let perf_cpu_order = if let Ok(em) = &ctx.em {
+            EnergyModelOptimizer::get_perf_cpu_order_table(em, &cpus_pf)
         } else {
             EnergyModelOptimizer::get_fake_perf_cpu_order_table(&cpus_pf, &cpus_ps)
         };
@@ -277,7 +276,7 @@ impl CpuOrderCtx {
     }
 
     /// Build a list of compute domains
-    fn build_cpdom(cpu_ids: &Vec<CpuId>) -> Option<BTreeMap<ComputeDomainId, ComputeDomain>> {
+    fn build_cpdom(cpu_ids: &[CpuId]) -> Option<BTreeMap<ComputeDomainId, ComputeDomain>> {
         // Note that building compute domain is independent to CPU order
         // so it is okay to use any cpus_*.
 
@@ -387,9 +386,9 @@ impl CpuOrderCtx {
     }
 
     /// Circular sorting of a list from a starting point
-    fn circular_sort(start: usize, the_rest: &Vec<usize>) -> Vec<usize> {
+    fn circular_sort(start: usize, the_rest: &[usize]) -> Vec<usize> {
         // Create a full list including 'start'
-        let mut list = the_rest.clone();
+        let mut list = the_rest.to_owned();
         list.push(start);
         list.sort();
 
@@ -472,7 +471,7 @@ struct EnergyModelOptimizer<'a> {
 }
 
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialOrd)]
-struct PDS<'a> {
+struct Pds<'a> {
     pd: &'a PerfDomain,
     ps: &'a PerfState,
 }
@@ -496,7 +495,7 @@ const CPU_UNIT: usize = 100_000;
 const LOOKAHEAD_CNT: usize = 10;
 
 impl<'a> EnergyModelOptimizer<'a> {
-    fn new(em: &'a EnergyModel, cpus_pf: &'a Vec<CpuId>) -> EnergyModelOptimizer<'a> {
+    fn new(em: &'a EnergyModel, cpus_pf: &[CpuId]) -> EnergyModelOptimizer<'a> {
         let tot_perf = em.perf_total();
 
         let pdss_infos: BTreeMap<usize, RefCell<HashSet<PDSetInfo<'a>>>> = BTreeMap::new();
@@ -540,9 +539,9 @@ impl<'a> EnergyModelOptimizer<'a> {
 
     fn get_perf_cpu_order_table(
         em: &'a EnergyModel,
-        cpus_pf: &'a Vec<CpuId>,
+        cpus_pf: &'a [CpuId],
     ) -> BTreeMap<usize, PerfCpuOrder> {
-        let emo = EnergyModelOptimizer::new(em, &cpus_pf);
+        let emo = EnergyModelOptimizer::new(em, cpus_pf);
         emo.gen_perf_cpu_order_table();
         let perf_cpu_order = emo.perf_cpu_order.borrow().clone();
 
@@ -550,8 +549,8 @@ impl<'a> EnergyModelOptimizer<'a> {
     }
 
     fn get_fake_perf_cpu_order_table(
-        cpus_pf: &'a Vec<CpuId>,
-        cpus_ps: &'a Vec<CpuId>,
+        cpus_pf: &[CpuId],
+        cpus_ps: &[CpuId],
     ) -> BTreeMap<usize, PerfCpuOrder> {
         let tot_perf: usize = cpus_pf.iter().map(|cpuid| cpuid.cpu_cap).sum();
 
@@ -565,19 +564,17 @@ impl<'a> EnergyModelOptimizer<'a> {
         perf_cpu_order
     }
 
-    fn fake_pco(tot_perf: usize, cpuids: &'a Vec<CpuId>, powersave: bool) -> PerfCpuOrder {
-        let perf_cap;
-
-        if powersave {
-            perf_cap = cpuids[0].cpu_cap;
+    fn fake_pco(tot_perf: usize, cpuids: &[CpuId], powersave: bool) -> PerfCpuOrder {
+        let perf_cap = if powersave {
+            cpuids[0].cpu_cap
         } else {
-            perf_cap = tot_perf;
-        }
+            tot_perf
+        };
 
         let perf_util: f32 = (perf_cap as f32) / (tot_perf as f32);
         let cpus: Vec<usize> = cpuids.iter().map(|cpuid| cpuid.cpu_adx).collect();
-        let cpus_perf: Vec<usize> = cpus[..1].iter().map(|&cpuid| cpuid).collect();
-        let cpus_ovflw: Vec<usize> = cpus[1..].iter().map(|&cpuid| cpuid).collect();
+        let cpus_perf: Vec<usize> = cpus[..1].to_vec();
+        let cpus_ovflw: Vec<usize> = cpus[1..].to_vec();
         PerfCpuOrder {
             perf_cap,
             perf_util,
@@ -672,7 +669,7 @@ impl<'a> EnergyModelOptimizer<'a> {
 
             let mut cpus_ovflw: Vec<usize> = vec![];
             for &cpu_adx in ovrflw_cpus_all.iter() {
-                if cpu_set.get(&cpu_adx).is_none() {
+                if !cpu_set.contains(&cpu_adx) {
                     cpus_ovflw.push(cpu_adx);
                     cpu_set.insert(cpu_adx);
                 }
@@ -689,10 +686,10 @@ impl<'a> EnergyModelOptimizer<'a> {
     }
 
     /// Sort the CPU IDs by topological order (@self.cpus_topological_order).
-    fn sort_cpus_by_topological_order(&'a self, cpus: &Vec<usize>) -> Vec<usize> {
+    fn sort_cpus_by_topological_order(&'a self, cpus: &[usize]) -> Vec<usize> {
         let mut sorted: Vec<usize> = vec![];
         for &cpu_adx in self.cpus_topological_order.iter() {
-            if let Some(_) = cpus.iter().find(|&&x| x == cpu_adx) {
+            if cpus.contains(&cpu_adx) {
                 sorted.push(cpu_adx);
             }
         }
@@ -1001,11 +998,11 @@ impl<'a> EnergyModelOptimizer<'a> {
 
     /// Get a vector of (performance domain, performance state) to achieve
     /// the given CPU utilization, @util.
-    fn gen_pds_set(&self, util: f32) -> Vec<PDS<'_>> {
+    fn gen_pds_set(&self, util: f32) -> Vec<Pds<'_>> {
         let mut pds_set = vec![];
         for (_, pd) in self.em.perf_doms.iter() {
             let ps = pd.select_perf_state(util).unwrap();
-            let pds = PDS::new(pd, ps);
+            let pds = Pds::new(pd, ps);
             pds_set.push(pds);
         }
         self.expand_pds_set(&mut pds_set);
@@ -1015,7 +1012,7 @@ impl<'a> EnergyModelOptimizer<'a> {
     /// Expand a PDS vector such that a performance domain with X CPUs
     /// has N elements in the vector. This is purely for generating
     /// combinations easy.
-    fn expand_pds_set(&self, pds_set: &mut Vec<PDS<'_>>) {
+    fn expand_pds_set(&self, pds_set: &mut Vec<Pds<'_>>) {
         let mut xset = vec![];
         // For a performance domain having nr_cpus, add nr_cpus-1 more
         // PDS to make the PDS nr_cpus in the vector.
@@ -1032,13 +1029,13 @@ impl<'a> EnergyModelOptimizer<'a> {
     }
 }
 
-impl<'a> PDS<'_> {
-    fn new(pd: &'a PerfDomain, ps: &'a PerfState) -> PDS<'a> {
-        PDS { pd, ps }
+impl<'a> Pds<'_> {
+    fn new(pd: &'a PerfDomain, ps: &'a PerfState) -> Pds<'a> {
+        Pds { pd, ps }
     }
 }
 
-impl PartialEq for PDS<'_> {
+impl PartialEq for Pds<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.pd == other.pd && self.ps == other.ps
     }
@@ -1056,7 +1053,7 @@ impl PartialEq for PDCpu<'_> {
     }
 }
 
-impl fmt::Display for PDS<'_> {
+impl fmt::Display for Pds<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
@@ -1071,7 +1068,7 @@ impl fmt::Display for PDS<'_> {
 }
 
 impl<'a> PDSetInfo<'_> {
-    fn new(pds_set: Vec<PDS<'a>>) -> PDSetInfo<'a> {
+    fn new(pds_set: Vec<Pds<'a>>) -> PDSetInfo<'a> {
         // Create a pd_id_set and calculate performance and power.
         let mut performance = 0;
         let mut power = 0;
@@ -1084,18 +1081,17 @@ impl<'a> PDSetInfo<'_> {
         }
 
         // Create a pdcpu_set, so first gather the same PDS entries.
-        let mut pds_map: BTreeMap<PDS<'a>, RefCell<Vec<PDS<'a>>>> = BTreeMap::new();
+        let mut pds_map: BTreeMap<Pds<'a>, RefCell<Vec<Pds<'a>>>> = BTreeMap::new();
 
         for pds in pds_set.iter() {
-            let v = pds_map.get(&pds);
+            let v = pds_map.get(pds);
             match v {
                 Some(v) => {
                     let mut v = v.borrow_mut();
                     v.push(pds.clone());
                 }
                 None => {
-                    let mut v: Vec<PDS<'a>> = Vec::new();
-                    v.push(pds.clone());
+                    let v: Vec<Pds<'a>> = vec![pds.clone()];
                     pds_map.insert(pds.clone(), v.into());
                 }
             }
@@ -1164,13 +1160,13 @@ impl PartialEq for PerfCpuOrder {
 
 impl fmt::Display for PerfCpuOrder {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
+        writeln!(
             f,
-            "capacity bound:  {} ({}%)\n",
+            "capacity bound:  {} ({}%)",
             self.perf_cap,
             self.perf_util * 100.0
         )?;
-        write!(f, "  primary CPUs:  {:?}\n", self.cpus_perf.borrow())?;
+        writeln!(f, "  primary CPUs:  {:?}", self.cpus_perf.borrow())?;
         write!(f, "  overflow CPUs: {:?}", self.cpus_ovflw.borrow())?;
         Ok(())
     }

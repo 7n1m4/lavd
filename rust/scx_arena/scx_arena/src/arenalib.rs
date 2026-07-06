@@ -39,7 +39,7 @@ pub struct ArenaLib<'a> {
 
 impl<'a> ArenaLib<'a> {
     /// Maximum CPU mask size, derived from MAX_CPU_SUPPORTED.
-    const MAX_CPU_ARRSZ: usize = (MAX_CPU_SUPPORTED + 63) / 64;
+    const MAX_CPU_ARRSZ: usize = MAX_CPU_SUPPORTED.div_ceil(64);
 
     /// Amount of pages allocated at once form the BPF map. by the static stack allocator.
     const STATIC_ALLOC_PAGES_GRANULARITY: c_ulong = 8;
@@ -52,7 +52,7 @@ impl<'a> ArenaLib<'a> {
                 c_name.as_ptr(),
             )
         };
-        if ptr as u64 == 0 as u64 {
+        if ptr.is_null() {
             bail!("No program with name {} found in object", name);
         }
 
@@ -64,7 +64,7 @@ impl<'a> ArenaLib<'a> {
         // Reach into the object and get the fd of the program
         // Get the fd of the test program to run
 
-        return Ok(output.return_value as i32);
+        Ok(output.return_value as i32)
     }
 
     /// Set up basic library state.
@@ -101,7 +101,7 @@ impl<'a> ArenaLib<'a> {
         };
 
         // Exclude memory-only NUMA nodes
-        if mask.into_iter().all(|&b| b == 0) {
+        if mask.iter().all(|&b| b == 0) {
             return Ok(());
         }
 
@@ -164,8 +164,7 @@ impl<'a> ArenaLib<'a> {
     /// the actual host topology to keep per-node allocation as small as
     /// possible.
     ///
-    /// NOTE: rust/scx_arena/selftests/src/main.rs::setup_topology() contains
-    /// equivalent logic and must be kept in sync with this function.
+    /// Keep this logic in sync with the BPF arena topology initialization.
     fn setup_topology_max_children(&self, topo: &Topology) -> Result<()> {
         // Compute the maximum number of children at each topology level.
         // TOPO_TOP  (0): children are NUMA nodes

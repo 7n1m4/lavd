@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure
-- Root docs: README.md, DEVELOPER_GUIDE.md, INSTALL.md, OVERVIEW.md
+- Root docs: README.md
 - Scheduler: scheds/rust/scx_lavd/src/ (userspace) and scheds/rust/scx_lavd/src/bpf/ (BPF scheduler)
 - Hyprland daemon: scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
 - Systemd/services: services/
@@ -40,7 +40,7 @@
 *MCP hook* `jcodemunch list_content` shines when you have already
 indexed a repo and need to search across **both** code and docs (TOML, Markdown,
 Dockerfile) simultaneously — for example, pinpointing where a scheduling
-constant is documented in `OVERVIEW.md` and referenced in `src/bpf/` at the same
+constant is documented in `README.md` and referenced in `src/bpf/` at the same
 time.
 
 ### 2. Exact symbol search

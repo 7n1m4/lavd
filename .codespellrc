@@ -5,7 +5,6 @@
 # Comma-separated list of paths/globs to skip.
 skip =
     ./scheds/vmlinux,
-    ./rust/scx_raw_pmu,
     ./**/*.autogen.*,
     ./rust/scx_utils/src/enums.rs
 

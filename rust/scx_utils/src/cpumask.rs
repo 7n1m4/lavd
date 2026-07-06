@@ -98,6 +98,20 @@ pub struct Cpumask {
     mask: BitVec<u64, Lsb0>,
 }
 
+impl Default for Cpumask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::str::FromStr for Cpumask {
+    type Err = anyhow::Error;
+
+    fn from_str(cpumask: &str) -> Result<Self> {
+        Self::parse(cpumask)
+    }
+}
+
 impl Cpumask {
     fn check_cpu(&self, cpu: usize) -> Result<()> {
         if cpu >= mask_width() {
@@ -115,7 +129,12 @@ impl Cpumask {
     }
 
     /// Build a Cpumask object from a hexadecimal string.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(cpumask: &str) -> Result<Cpumask> {
+        Self::parse(cpumask)
+    }
+
+    fn parse(cpumask: &str) -> Result<Cpumask> {
         match cpumask {
             "none" => {
                 let mask = bitvec![u64, Lsb0; 0; mask_width()];
@@ -132,7 +151,7 @@ impl Cpumask {
                 .strip_prefix("0x")
                 .unwrap_or(cpumask)
                 .replace('_', "");
-            if tmp_str.len() % 2 != 0 {
+            if !tmp_str.len().is_multiple_of(2) {
                 tmp_str = "0".to_string() + &tmp_str;
             }
             tmp_str

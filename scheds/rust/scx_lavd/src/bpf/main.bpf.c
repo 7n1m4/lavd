@@ -65,7 +65,7 @@
  * 4. Time slice: how long execute a task
  * --------------------------------------
  *
- * We borrow the time slice calculation idea from the CFS and scx_rustland
+ * We borrow the time slice calculation idea from CFS and prior sched_ext
  * schedulers. The LAVD scheduler tries to schedule all the runnable tasks at
  * least once within a predefined time window, which is called a targeted
  * latency. For example, if a targeted latency is 15 msec and 10 tasks are

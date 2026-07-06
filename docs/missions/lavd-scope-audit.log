@@ -1,0 +1,1613 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /home/vi/animaschedext
+model: gpt-5.5
+provider: anyrouter
+approval: never
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f34f1-6ef3-7a22-a994-79061b57e601
+--------
+user
+Audit this repository for whether it has been purged down to LAVD-only content. Do not modify files. Read AGENTS.md, inspect top-level tracked paths and scheds/rust contents, and produce a concise report listing obvious non-LAVD components that remain, plus what would need deletion if the fork should focus only on scx_lavd/anima LAVD.
+codex
+I’ll use the `using-superpowers` skill first because the session requires skill routing before task work, then I’ll inspect the repository read-only as requested.
+exec
+/usr/bin/bash -lc "sed -n '1,220p' /home/vi/.agents/skills/superpowers/using-superpowers/SKILL.md" in /home/vi/animaschedext
+ succeeded in 0ms:
+---
+name: using-superpowers
+description: Use when starting any conversation - establishes how to find and use skills, requiring skill invocation before ANY response including clarifying questions
+---
+
+<SUBAGENT-STOP>
+If you were dispatched as a subagent to execute a specific task, skip this skill.
+</SUBAGENT-STOP>
+
+<EXTREMELY-IMPORTANT>
+If you think there is even a 1% chance a skill might apply to what you are doing, you ABSOLUTELY MUST invoke the skill.
+
+IF A SKILL APPLIES TO YOUR TASK, YOU DO NOT HAVE A CHOICE. YOU MUST USE IT.
+
+This is not negotiable. This is not optional. You cannot rationalize your way out of this.
+</EXTREMELY-IMPORTANT>
+
+## Instruction Priority
+
+Superpowers skills override default system prompt behavior, but **user instructions always take precedence**:
+
+1. **User's explicit instructions** (CLAUDE.md, GEMINI.md, AGENTS.md, direct requests) — highest priority
+2. **Superpowers skills** — override default system behavior where they conflict
+3. **Default system prompt** — lowest priority
+
+If CLAUDE.md, GEMINI.md, or AGENTS.md says "don't use TDD" and a skill says "always use TDD," follow the user's instructions. The user is in control.
+
+## How to Access Skills
+
+**Never read skill files manually with file tools** — always use your platform's skill-loading mechanism so the skill is properly activated.
+
+**In Claude Code:** Use the `Skill` tool. When you invoke a skill, its content is loaded and presented to you — follow it directly.
+
+**In Codex:** Skills load natively. Follow the instructions presented when a skill activates.
+
+**In Copilot CLI:** Use the `skill` tool. Skills are auto-discovered from installed plugins.
+
+**In Gemini CLI:** Skills activate via the `activate_skill` tool. Gemini loads skill metadata at session start and activates the full content on demand.
+
+**In other environments:** Check your platform's documentation for how skills are loaded.
+
+## Platform Adaptation
+
+Skills speak in actions ("dispatch a subagent", "create a todo", "read a file") rather than naming any one runtime's tools. For per-platform tool equivalents and instructions-file conventions, see [claude-code-tools.md](references/claude-code-tools.md), [codex-tools.md](references/codex-tools.md), [copilot-tools.md](references/copilot-tools.md), [gemini-tools.md](references/gemini-tools.md), [pi-tools.md](references/pi-tools.md), and [antigravity-tools.md](references/antigravity-tools.md). Gemini CLI users get the tool mapping loaded automatically via GEMINI.md.
+
+# Using Skills
+
+## The Rule
+
+**Invoke relevant or requested skills BEFORE any response or action.** Even a 1% chance a skill might apply means that you should invoke the skill to check. If an invoked skill turns out to be wrong for the situation, you don't need to use it.
+
+```dot
+digraph skill_flow {
+    "User message received" [shape=doublecircle];
+    "About to enter plan mode?" [shape=doublecircle];
+    "Already brainstormed?" [shape=diamond];
+    "Invoke brainstorming skill" [shape=box];
+    "Might any skill apply?" [shape=diamond];
+    "Invoke the skill" [shape=box];
+    "Announce: 'Using [skill] to [purpose]'" [shape=box];
+    "Has checklist?" [shape=diamond];
+    "Create a todo per item" [shape=box];
+    "Follow skill exactly" [shape=box];
+    "Respond (including clarifications)" [shape=doublecircle];
+
+    "About to enter plan mode?" -> "Already brainstormed?";
+    "Already brainstormed?" -> "Invoke brainstorming skill" [label="no"];
+    "Already brainstormed?" -> "Might any skill apply?" [label="yes"];
+    "Invoke brainstorming skill" -> "Might any skill apply?";
+
+    "User message received" -> "Might any skill apply?";
+    "Might any skill apply?" -> "Invoke the skill" [label="yes, even 1%"];
+    "Might any skill apply?" -> "Respond (including clarifications)" [label="definitely not"];
+    "Invoke the skill" -> "Announce: 'Using [skill] to [purpose]'";
+    "Announce: 'Using [skill] to [purpose]'" -> "Has checklist?";
+    "Has checklist?" -> "Create a todo per item" [label="yes"];
+    "Has checklist?" -> "Follow skill exactly" [label="no"];
+    "Create a todo per item" -> "Follow skill exactly";
+}
+```
+
+## Red Flags
+
+These thoughts mean STOP—you're rationalizing:
+
+| Thought | Reality |
+|---------|---------|
+| "This is just a simple question" | Questions are tasks. Check for skills. |
+| "I need more context first" | Skill check comes BEFORE clarifying questions. |
+| "Let me explore the codebase first" | Skills tell you HOW to explore. Check first. |
+| "I can check git/files quickly" | Files lack conversation context. Check for skills. |
+| "Let me gather information first" | Skills tell you HOW to gather information. |
+| "This doesn't need a formal skill" | If a skill exists, use it. |
+| "I remember this skill" | Skills evolve. Read current version. |
+| "This doesn't count as a task" | Action = task. Check for skills. |
+| "The skill is overkill" | Simple things become complex. Use it. |
+| "I'll just do this one thing first" | Check BEFORE doing anything. |
+| "This feels productive" | Undisciplined action wastes time. Skills prevent this. |
+| "I know what that means" | Knowing the concept ≠ using the skill. Invoke it. |
+
+## Skill Priority
+
+When multiple skills could apply, use this order:
+
+1. **Process skills first** (brainstorming, systematic-debugging) - these determine HOW to approach the task
+2. **Implementation skills second** (frontend-design, mcp-builder) - these guide execution
+
+"Let's build X" → brainstorming first, then implementation skills.
+"Fix this bug" → systematic-debugging first, then domain-specific skills.
+
+## Skill Types
+
+**Rigid** (TDD, systematic-debugging): Follow exactly. Don't adapt away discipline.
+
+**Flexible** (patterns): Adapt principles to context.
+
+The skill itself tells you which.
+
+## User Instructions
+
+Instructions say WHAT, not HOW. "Add X" or "Fix Y" doesn't mean skip workflows.
+
+codex
+I’m gathering the repository shape from tracked files first, then I’ll drill into `scheds/rust` to identify components that are clearly unrelated to `scx_lavd` or the anima LAVD fork.
+exec
+/usr/bin/bash -lc "git ls-files scheds/rust | sed 's#"'^scheds/rust/##'"' | awk -F/ 'NF {print "'$1}'"' | sort -u" in /home/vi/animaschedext
+exec
+/usr/bin/bash -lc "git ls-files | awk -F/ '{print "'$1}'"' | sort -u" in /home/vi/animaschedext
+ succeeded in 0ms:
+.cargo
+.clang-format
+.clangd
+.codespellrc
+.editorconfig
+.githooks
+.github
+.gitignore
+.gitmodules
+.nix
+AGENTS.md
+BREAKING_CHANGES.md
+CARGO_BUILD.md
+Cargo.lock
+Cargo.toml
+DEVELOPER_GUIDE.md
+DHQ_README.md
+INSTALL.md
+LICENSE
+OVERVIEW.md
+README.md
+RELEASE.md
+UNIT_TESTING_GUIDE.md
+animatab
+cargo-publish.py
+docs
+kernel.config
+lib
+pgo-lto.sh
+rust
+rust-toolchain.toml
+rustfmt.toml
+scheds
+scripts
+services
+tools
+version-tool.py
+
+ succeeded in 235ms:
+.gitignore
+README.md
+scx_beerland
+scx_bpfland
+scx_cake
+scx_chaos
+scx_cosmos
+scx_flash
+scx_lavd
+scx_layered
+scx_mitosis
+scx_p2dq
+scx_pandemonium
+scx_rustland
+scx_rusty
+scx_tickless
+
+exec
+/usr/bin/bash -lc "sed -n '1,220p' AGENTS.md" in /home/vi/animaschedext
+ succeeded in 0ms:
+# Repository Guidelines
+
+## Project Structure
+- Root docs: README.md, DEVELOPER_GUIDE.md, INSTALL.md, OVERVIEW.md
+- Scheduler: scheds/rust/scx_lavd/src/ (userspace) and scheds/rust/scx_lavd/src/bpf/ (BPF scheduler)
+- Hyprland daemon: scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+- Systemd/services: services/
+- Shared Rust workspace: rust/ and lib/
+
+## Build / Format / Docs
+- cargo build --release
+- cargo fmt
+- cargo fmt -- --check
+
+## Coding Conventions
+- Format with cargo fmt before committing
+- Rust: snake_case for identifiers, PasicalCase for types
+- Keep BPF patches minimal and local to scheduler logic
+- When editing, match the existing code style in the file
+
+## Verification
+- For scheduler-related changes, describe how you validated behavior
+- For BPF changes, consider verifier and runtime impact
+- Run relevant workspace checks before opening a PR
+
+## Commits & PRs
+- Use concise, present-tense commit messages explaining behavior change
+- Keep commits focused on one concern
+- PRs should summarize the change, rationale, affected paths, and how it was tested
+
+## SOP: MCP Tool Routing for Codebase Exploration
+
+> Always route through the native Droid equivalents listed in the Deferred toolbox
+> before falling back to their corresponding MCP hooks. `Indexing first, searching,
+> then reading full files only as needed` keeps exploration cheap.
+
+### 1. Torrent of the whole tree
+
+*Prefer* `LS` over `jcodemunch list_watchers` for one-shot directory listing.
+*MCP hook* `jcodemunch list_content` shines when you have already
+indexed a repo and need to search across **both** code and docs (TOML, Markdown,
+Dockerfile) simultaneously — for example, pinpointing where a scheduling
+constant is documented in `OVERVIEW.md` and referenced in `src/bpf/` at the same
+time.
+
+### 2. Exact symbol search
+
+*Try* `Grep` first with type filter `type=rust` or `case_insensitive=true`
+and `context`/`line_numbers` on.
+*MCP hook* `jcodemunch search_units` beats `Grep` when symbols cross
+file boundaries or when you expect to also surface documentation sections and
+doc comments — searching `LAT_CRI` across code + adjacent Markdowns is a typical
+case.
+
+### 3. Outline / signature drill-down
+
+*Use* `Glob` and `Read` with a hand-picked line range.
+*MCP hook* `jcodemunch get_outline` + `get_unit_context` returns
+token-budgeted symbol capsules — better than big-file `Read` when you need a
+summary of every struct or inline function in `main.bpf.c` without reading
+the whole object.
+
+### 4. Symbol-level context (callers / callees / references)
+
+*Start* with `Grep` and cursor the surrounding block with `context`.
+*MCP hooks* `jcodemunch find_references` / `get_blast_radius` /
+`get_call_hierarchy` win when the symbol appears in ten or more files
+(danger zone for missing places to patch during a refactor). For example,
+tracing which call sites actually depend on the BPF map update in
+`anima.bpf.c` is easier via blast radius than multiple greps across crates.
+
+### 5. Dead code and refactoring
+
+*No native equivalents.* Use these MCP hooks directly:
+`jcodemunch get_dead_code_v2` + `find_similar_symbols` to spot duplicate
+LAVD helper code that could be hoisted into `lib/`; `check_safe` before
+renaming lat-calc constants; `plan_refactoring` to produce concrete
+edit blocks you can feed into the file patches.
+
+### 6. Structural anti-pattern scan
+
+*No native equivalents.* `jcodemunch find_implementations` for locating
+polyfilles of ticket-function interfaces, `search_ast` for language-agnostic
+scans (empty catch blocks, deeply nested loops) across `.bpf.c` Rust and
+BPF C alike when global static-code violations need hunting down.
+
+### 7. Runtime diagnostics and profiling
+
+*No native equivalents.* Use `jcodemunch import_runtime_signal` /
+`find_hot_paths` when tuning BPF scheduler overhead on real workloads;
+`get_symbol_complexity` / `get_repo_health` as a quick triage before a larger
+rewrite.
+
+### Rules of thumb
+
+1. **Always start with `LS / Grep / Read`.** Spin up `jcodemunch` only when
+   the question crosses file or language boundaries, needs a hierarchical
+   view, or is a "structural smell" / "refactor" query.
+2. **Never install `jcodemunch`just for a "deeper search" click** — first
+   exhaust native tooling.
+3. **Feed MCP context to patches.** Wrap `get_symbol_source` /
+   `find_references` output into every file edit so downstream reviewers see the
+   provenance chain.
+4. **Alias usage by intent.** Before each MCP hit, add one line:
+   _"why `_hook_` > native: <one-line reason>."_ This keeps your SOP honest
+   and explainable to new contributors.
+
+codex
+The first pass confirms `scheds/rust` still contains the full upstream-style scheduler set, not just `scx_lavd`. I’m checking workspace manifests and tracked path counts now so the deletion report separates obvious scheduler removals from shared infrastructure that may still be needed by LAVD.
+exec
+/usr/bin/bash -lc "find scheds/rust -maxdepth 2 -mindepth 1 -type f \\( -name Cargo.toml -o -name README.md \\) | sort" in /home/vi/animaschedext
+exec
+/usr/bin/bash -lc "git ls-files | awk -F/ '{count["'$1]++} END {for (p in count) print count[p], p}'"' | sort -k2" in /home/vi/animaschedext
+exec
+/usr/bin/bash -lc "sed -n '1,220p' Cargo.toml" in /home/vi/animaschedext
+ succeeded in 0ms:
+[workspace]
+members = [
+    "rust/scx_arena/scx_arena",
+    "rust/scx_arena/selftests",
+    "rust/scx_bpf_unittests",
+    "rust/scx_cargo",
+    "rust/scx_raw_pmu",
+    "rust/scx_rustland_core",
+    "rust/scx_stats",
+    "rust/scx_stats/scx_stats_derive",
+    "rust/scx_userspace_arena",
+    "rust/scx_utils",
+    "scheds/rust/scx_beerland",
+    "scheds/rust/scx_bpfland",
+    "scheds/rust/scx_cake",
+    "scheds/rust/scx_chaos",
+    "scheds/rust/scx_cosmos",
+    "scheds/rust/scx_flash",
+    "scheds/rust/scx_lavd",
+    "scheds/rust/scx_layered",
+    "scheds/rust/scx_mitosis",
+    "scheds/rust/scx_p2dq",
+    "scheds/rust/scx_pandemonium",
+    "scheds/rust/scx_rustland",
+    "scheds/rust/scx_rusty",
+    "scheds/rust/scx_tickless",
+    "scheds/experimental/scx_flow",
+    "scheds/experimental/scx_rlfifo",
+    "tools/scxcash",
+    "tools/scxtop",
+    "tools/vmlinux_docify",
+    "tools/xtask",
+]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+
+[profile.release-tiny]
+inherits = "release"
+opt-level = "z"
+lto = false
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 32
+panic = "abort"
+
+[profile.ci]
+inherits = "dev"
+debug = 0
+incremental = false
+strip = true
+lto = false
+
+exec
+/usr/bin/bash -lc 'find scheds -maxdepth 3 -type d | sort' in /home/vi/animaschedext
+ succeeded in 0ms:
+scheds
+scheds/experimental
+scheds/experimental/scx_flow
+scheds/experimental/scx_flow/src
+scheds/experimental/scx_rlfifo
+scheds/experimental/scx_rlfifo/src
+scheds/experimental/scx_rlfifo/veristat
+scheds/experimental/scx_wd40
+scheds/experimental/scx_wd40/src
+scheds/include
+scheds/include/bpf-compat
+scheds/include/bpf-compat/gnu
+scheds/include/lib
+scheds/include/lib/alloc
+scheds/include/scx
+scheds/rust
+scheds/rust/scx_beerland
+scheds/rust/scx_beerland/src
+scheds/rust/scx_beerland/veristat
+scheds/rust/scx_bpfland
+scheds/rust/scx_bpfland/src
+scheds/rust/scx_bpfland/veristat
+scheds/rust/scx_cake
+scheds/rust/scx_cake/.cargo
+scheds/rust/scx_cake/src
+scheds/rust/scx_cake/veristat
+scheds/rust/scx_chaos
+scheds/rust/scx_chaos/src
+scheds/rust/scx_chaos/veristat
+scheds/rust/scx_cosmos
+scheds/rust/scx_cosmos/src
+scheds/rust/scx_cosmos/veristat
+scheds/rust/scx_flash
+scheds/rust/scx_flash/src
+scheds/rust/scx_flash/veristat
+scheds/rust/scx_lavd
+scheds/rust/scx_lavd/examples
+scheds/rust/scx_lavd/src
+scheds/rust/scx_lavd/veristat
+scheds/rust/scx_layered
+scheds/rust/scx_layered/examples
+scheds/rust/scx_layered/integration
+scheds/rust/scx_layered/src
+scheds/rust/scx_layered/veristat
+scheds/rust/scx_mitosis
+scheds/rust/scx_mitosis/src
+scheds/rust/scx_mitosis/test
+scheds/rust/scx_mitosis/veristat
+scheds/rust/scx_p2dq
+scheds/rust/scx_p2dq/src
+scheds/rust/scx_p2dq/veristat
+scheds/rust/scx_pandemonium
+scheds/rust/scx_pandemonium/src
+scheds/rust/scx_pandemonium/veristat
+scheds/rust/scx_rustland
+scheds/rust/scx_rustland/src
+scheds/rust/scx_rustland/veristat
+scheds/rust/scx_rusty
+scheds/rust/scx_rusty/src
+scheds/rust/scx_rusty/veristat
+scheds/rust/scx_tickless
+scheds/rust/scx_tickless/src
+scheds/rust/scx_tickless/veristat
+scheds/vmlinux
+scheds/vmlinux/arch
+scheds/vmlinux/arch/arm
+scheds/vmlinux/arch/arm64
+scheds/vmlinux/arch/mips
+scheds/vmlinux/arch/powerpc
+scheds/vmlinux/arch/riscv
+scheds/vmlinux/arch/s390
+scheds/vmlinux/arch/x86
+
+ succeeded in 522ms:
+scheds/rust/README.md
+scheds/rust/scx_beerland/Cargo.toml
+scheds/rust/scx_beerland/README.md
+scheds/rust/scx_bpfland/Cargo.toml
+scheds/rust/scx_bpfland/README.md
+scheds/rust/scx_cake/Cargo.toml
+scheds/rust/scx_cake/README.md
+scheds/rust/scx_chaos/Cargo.toml
+scheds/rust/scx_chaos/README.md
+scheds/rust/scx_cosmos/Cargo.toml
+scheds/rust/scx_cosmos/README.md
+scheds/rust/scx_flash/Cargo.toml
+scheds/rust/scx_flash/README.md
+scheds/rust/scx_lavd/Cargo.toml
+scheds/rust/scx_lavd/README.md
+scheds/rust/scx_layered/Cargo.toml
+scheds/rust/scx_layered/README.md
+scheds/rust/scx_mitosis/Cargo.toml
+scheds/rust/scx_mitosis/README.md
+scheds/rust/scx_p2dq/Cargo.toml
+scheds/rust/scx_p2dq/README.md
+scheds/rust/scx_pandemonium/Cargo.toml
+scheds/rust/scx_pandemonium/README.md
+scheds/rust/scx_rustland/Cargo.toml
+scheds/rust/scx_rustland/README.md
+scheds/rust/scx_rusty/Cargo.toml
+scheds/rust/scx_rusty/README.md
+scheds/rust/scx_tickless/Cargo.toml
+scheds/rust/scx_tickless/README.md
+
+ succeeded in 489ms:
+1 .cargo
+1 .clang-format
+1 .clangd
+1 .codespellrc
+1 .editorconfig
+1 .githooks
+2 .github
+1 .gitignore
+1 .gitmodules
+7 .nix
+1 AGENTS.md
+1 BREAKING_CHANGES.md
+1 CARGO_BUILD.md
+1 Cargo.lock
+1 Cargo.toml
+1 DEVELOPER_GUIDE.md
+1 DHQ_README.md
+1 INSTALL.md
+1 LICENSE
+1 OVERVIEW.md
+1 README.md
+1 RELEASE.md
+1 UNIT_TESTING_GUIDE.md
+4 animatab
+1 cargo-publish.py
+3 docs
+1 kernel.config
+50 lib
+1 pgo-lto.sh
+1025 rust
+1 rust-toolchain.toml
+1 rustfmt.toml
+353 scheds
+17 scripts
+6 services
+142 tools
+1 version-tool.py
+
+codex
+`Cargo.toml` still lists every scheduler crate as workspace members, including experimental schedulers and tools. I’m doing a targeted text scan for `scx_` references in docs, services, scripts, and manifests to catch obvious cleanup targets outside the scheduler directories.
+exec
+/usr/bin/bash -lc "sed -n '1,220p' scheds/rust/README.md" in /home/vi/animaschedext
+ succeeded in 0ms:
+RUST SCHEDULERS
+===============
+
+# Introduction
+
+This directory contains schedulers with user space `Rust` components.
+
+The README in each scheduler directory provides some background and describes
+the types of workloads or scenarios they're designed to accommodate.  For more
+details on any of these schedulers, please see the header comment in their
+main.rs or \*.bpf.c files.
+
+# Schedulers
+
+- [scx_beerland](scx_beerland/README.md)
+- [scx_bpfland](scx_bpfland/README.md)
+- [scx_flash](scx_flash/README.md)
+- [scx_cake](scx_cake/README.md)
+- [scx_chaos](scx_chaos/README.md)
+- [scx_cosmos](scx_cosmos/README.md)
+- [scx_lavd](scx_lavd/README.md)
+- [scx_layered](scx_layered/README.md)
+- [scx_mitosis](scx_mitosis/README.md)
+- [scx_pandemonium](scx_pandemonium/README.md)
+- [scx_p2dq](scx_p2dq/README.md)
+- [scx_rustland](scx_rustland/README.md)
+- [scx_rusty](scx_rusty/README.md)
+- [scx_tickless](scx_tickless/README.md)
+
+exec
+/usr/bin/bash -lc "git ls-files scheds/experimental scheds/include scheds/vmlinux | awk -F/ '{print "'$1"/"$2"/"$3}'"' | sort -u" in /home/vi/animaschedext
+ succeeded in 0ms:
+scheds/experimental/.gitignore
+scheds/experimental/README.md
+scheds/experimental/scx_flow
+scheds/experimental/scx_rlfifo
+scheds/experimental/scx_wd40
+scheds/include/.gitignore
+scheds/include/bpf-compat
+scheds/include/bpf_arena_common.bpf.h
+scheds/include/bpf_arena_spin_lock.h
+scheds/include/bpf_atomic.h
+scheds/include/bpf_experimental.h
+scheds/include/lib
+scheds/include/scx
+scheds/vmlinux/arch
+scheds/vmlinux/vmlinux.h
+
+exec
+/usr/bin/bash -lc "find services -maxdepth 2 -type f -print | sort | xargs -r sed -n '1,120p'" in /home/vi/animaschedext
+ succeeded in 0ms:
+# A Quick Start Guide
+
+This guide provides instructions for running the SCX schedulers as a systemd service and checking its logs.
+
+## Getting Started
+
+At the very beginning, configure the /etc/default/scx file:
+
+- in the SCX_SCHEDULER variable, select the scheduler you are interested in
+
+- in the SCX_FLAGS variable, specify the flags you want to add. To do this, execute and read what flags you can add.
+
+```
+scx_SCHEDNAME --help
+```
+
+To start the SCX scheduler at boot, you need to run the systemd service as root. Here are the steps:
+
+
+- Enable the service:
+
+```
+systemctl enable scx.service
+```
+
+- Start the service:
+
+```
+systemctl start scx.service
+```
+
+Alternatively, you can use a shortened version of these commands:
+
+```
+systemctl enable --now scx.service
+```
+
+- To check the status of the service, use the following command:
+
+```
+systemctl status scx.service
+```
+
+## Override global configuration
+
+It is possible to override the global scx settings using systemd environment
+variables `SCX_SCHEDULER_OVERRIDE` and `SCX_FLAGS_OVERRIDE`.
+
+Example:
+
+```
+systemctl set-environment SCX_SCHEDULER_OVERRIDE=scx_rustland
+systemctl set-environment SCX_FLAGS_OVERRIDE="-s 10000"
+systemctl restart scx
+```
+
+If you want to restore the default value from the `/etc/default/scx` file execute:
+
+```
+systemctl unset-environment SCX_SCHEDULER_OVERRIDE
+systemctl unset-environment SCX_FLAGS_OVERRIDE
+systemctl restart scx
+```
+
+## Checking journald Logs
+
+
+- To view the logs, use the following command:
+
+```
+journalctl -u scx.service
+```
+
+- To view the logs of the current session use the command
+
+```
+journalctl -u scx.service -b 0
+```
+
+# SPDX-License-Identifier: GPL-2.0
+#
+# AnimaSchedEXT — Hyprland focus daemon (systemd USER service)
+#
+# Subscribes to Hyprland's activewindowv2 events and pushes the focused
+# PID into scx_lavd's pinned anima_active_pids BPF map. LAVD then gives
+# that PID the tightest virtual deadline (see anima.bpf.h).
+#
+# Why a user service (not a system service)?
+#   The daemon needs HYPRLAND_INSTANCE_SIGNATURE and XDG_RUNTIME_DIR to
+#   talk to the Hyprland IPC socket. These env vars are only present in
+#   the user's graphical session — a system service can't see them
+#   without ugly passthrough hacks. Plus the pins are chmod 666 so no
+#   root/CAP_BPF is required to update the maps.
+#
+# Install:
+#   install -Dm644 anima-hypr.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now anima-hypr.service
+#
+# Logs:
+#   journalctl --user -u anima-hypr.service -f
+
+[Unit]
+Description=AnimAIOS Hyprland focus daemon (scx_lavd boost)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# window+tree: boost focused PID + its low-CPU direct children. Switch to
+# just "window" if you want the focused process only (no descendants).
+ExecStart=/usr/local/bin/anima-hypr-daemon window+tree
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+# Drop-in for scx_loader.service — swap in the AnimaSchedEXT build of
+# scx_lavd (the one that pins anima_active_pids for the focus daemon).
+#
+
+exec
+/usr/bin/bash -lc "git ls-files services scripts tools docs '*.md' Cargo.toml | xargs rg -n \"scx_(beerland|bpfland|cake|chaos|cosmos|flash|layered|mitosis|p2dq|pandemonium|rustland|rusty|tickless|flow|rlfifo|wd40|lavd)\"" in /home/vi/animaschedext
+ succeeded in 230ms:
+tools/scxtop/src/bpf/intf.h:23:   * (https://github.com/sched-ext/scx/blob/main/scheds/rust/scx_layered/src/bpf/main.bpf.c#L577).
+docs/missions/audio-boost-review.log:14:Read AGENTS.md and review the current diff for scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs. Focus only on the audio boost review items: audio polling should update the pinned map without waiting for focus events, and browser-mode updates should preserve active audio PIDs. Do not modify files. Report whether the current diff addresses those issues, cite specific functions/lines, and mention any remaining risk or test gap.
+docs/missions/audio-boost-review.log:151:- Scheduler: scheds/rust/scx_lavd/src/ (userspace) and scheds/rust/scx_lavd/src/bpf/ (BPF scheduler)
+docs/missions/audio-boost-review.log:152:- Hyprland daemon: scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+docs/missions/audio-boost-review.log:255:/usr/bin/bash -lc 'git diff -- scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs' in /home/vi/animaschedext
+docs/missions/audio-boost-review.log:257:diff --git a/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs b/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+docs/missions/audio-boost-review.log:259:--- a/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+docs/missions/audio-boost-review.log:260:+++ b/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+docs/missions/audio-boost-review.log:341:-                "cannot open pinned BPF map at {MAP_PIN_PATH} — is scx_lavd-anima running?"
+docs/missions/audio-boost-review.log:344:+            format!("cannot open pinned BPF map at {MAP_PIN_PATH} — is scx_lavd-anima running?")
+docs/missions/audio-boost-review.log:348:                 "cannot open pinned BPF config map at {CONFIG_PIN_PATH} — is scx_lavd-anima running?"
+docs/missions/audio-boost-review.log:597:/usr/bin/bash -lc 'git status --short -- scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs' in /home/vi/animaschedext
+docs/missions/audio-boost-review.log:599: M scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+docs/missions/audio-boost-review.log:604:/usr/bin/bash -lc "nl -ba scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs | sed -n '60,210p'" in /home/vi/animaschedext
+docs/missions/audio-boost-review.log:672:   126	    /// BPF map by bpffs path. Requires `scx_lavd-anima` to be running
+docs/missions/audio-boost-review.log:678:   132	            format!("cannot open pinned BPF map at {MAP_PIN_PATH} — is scx_lavd-anima running?")
+docs/missions/audio-boost-review.log:682:   136	                "cannot open pinned BPF config map at {CONFIG_PIN_PATH} — is scx_lavd-anima running?"
+docs/missions/audio-boost-review.log:759:/usr/bin/bash -lc "nl -ba scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs | sed -n '360,480p'" in /home/vi/animaschedext
+docs/missions/audio-boost-review.log:884:/usr/bin/bash -lc "nl -ba scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs | sed -n '520,650p'" in /home/vi/animaschedext
+docs/missions/audio-boost-review.log:1019:/usr/bin/bash -lc "nl -ba scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs | sed -n '205,240p;480,515p;641,665p'" in /home/vi/animaschedext
+docs/missions/audio-boost-review.log:1077:   500	        "Cannot open pinned map — is scx_lavd-anima running and pinning \
+docs/missions/audio-boost-review.log:1124:- Audio polling updates the pinned map independently of focus events. The audio thread polls `sample_audio()` and calls `g.update_audio(set)` directly at [anima_hypr_daemon.rs:577](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:577) and [anima_hypr_daemon.rs:589](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:589). `update_audio()` rebuilds audio state and immediately calls `apply_active_keys()` at [anima_hypr_daemon.rs:200](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:200), which performs the actual pinned-map deletes/inserts at [anima_hypr_daemon.rs:205](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:205).
+docs/missions/audio-boost-review.log:1126:- Browser-mode updates preserve active audio PIDs. `BoostState` tracks `base_keys` separately from `audio_pids` at [anima_hypr_daemon.rs:81](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:81), and `rebuild()` unions both sets at [anima_hypr_daemon.rs:115](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:115). `update_browser()` only replaces the base focus/tab set, then applies the rebuilt union at [anima_hypr_daemon.rs:167](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:167).
+docs/missions/audio-boost-review.log:1128:Remaining risk/test gap: the added tests cover the `BoostState` union behavior at [anima_hypr_daemon.rs:467](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:467) and [anima_hypr_daemon.rs:482](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:482), but there is no mocked or integration test proving `update_audio()` actually reconciles `last_keys` into the pinned map. Also, if `pactl` fails to spawn after audio PIDs were previously recorded, the error path logs but does not clear stale audio PIDs until a later successful poll returns an empty set.
+docs/missions/audio-boost-review.log:1135:- Audio polling updates the pinned map independently of focus events. The audio thread polls `sample_audio()` and calls `g.update_audio(set)` directly at [anima_hypr_daemon.rs:577](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:577) and [anima_hypr_daemon.rs:589](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:589). `update_audio()` rebuilds audio state and immediately calls `apply_active_keys()` at [anima_hypr_daemon.rs:200](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:200), which performs the actual pinned-map deletes/inserts at [anima_hypr_daemon.rs:205](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:205).
+docs/missions/audio-boost-review.log:1137:- Browser-mode updates preserve active audio PIDs. `BoostState` tracks `base_keys` separately from `audio_pids` at [anima_hypr_daemon.rs:81](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:81), and `rebuild()` unions both sets at [anima_hypr_daemon.rs:115](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:115). `update_browser()` only replaces the base focus/tab set, then applies the rebuilt union at [anima_hypr_daemon.rs:167](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:167).
+docs/missions/audio-boost-review.log:1139:Remaining risk/test gap: the added tests cover the `BoostState` union behavior at [anima_hypr_daemon.rs:467](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:467) and [anima_hypr_daemon.rs:482](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:482), but there is no mocked or integration test proving `update_audio()` actually reconciles `last_keys` into the pinned map. Also, if `pactl` fails to spawn after audio PIDs were previously recorded, the error path logs but does not clear stale audio PIDs until a later successful poll returns an empty set.
+scheds/experimental/scx_wd40/README.md:1:# scx_wd40
+scheds/experimental/scx_wd40/README.md:3:An experimental fork of the `scx_rusty` scheduler that uses BPF arenas to simplify scheduler development. Found in the main [`sched_ext`](https://github.com/sched-ext/scx/tree/main) repository. [Read more about `sched_ext`](https://github.com/sched-ext/scx/tree/main).
+scheds/rust/scx_pandemonium/README.md:7:PANDEMONIUM is included in the [sched-ext/scx](https://github.com/sched-ext/scx) project alongside scx_rusty, scx_lavd, scx_cosmos, scx_cake and the rest of the sched_ext family. Thank you to Piotr Gorski and the sched-ext team. PANDEMONIUM is made possible by contributions from the sched_ext, CachyOS, Gentoo, OpenSUSE, Arch and Ubuntu communities within the Linux ecosystem.
+scheds/rust/scx_pandemonium/README.md:11:12 AMD Zen CPUs, kernel 6.18+, clang 21. The tables below report v5.8.0 PANDEMONIUM numbers from a single-iteration bench-scale run across 2C/4C/8C/12C; the v5.9.0 deltas at 12C are summarized in the next subsection. EEVDF and scx_bpfland baselines are best-3-of-N historical (28 and 26 complete runs across 75 bench-scale sessions) — those baselines don't drift across PANDEMONIUM versions. v5.8.0 closed the 2C structural starvation class via the rescue-fairness fix and the missing CPU-bound demotion in stopping() that was leaving long-runners stuck at TIER_INTERACTIVE (longrun WORST 19s -> 13ms at 2C, mixed WORST 29s -> 16ms at 2C). Bench-fork-thread lands within 1% of EEVDF and ~40% ahead of scx_bpfland.
+scheds/rust/scx_pandemonium/README.md:29:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+scheds/rust/scx_pandemonium/README.md:40:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+scheds/rust/scx_pandemonium/README.md:47:Both modes beat EEVDF and scx_bpfland by a wide margin. Burst-storm cost is workload-sensitive across iterations.
+scheds/rust/scx_pandemonium/README.md:51:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+scheds/rust/scx_pandemonium/README.md:62:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+scheds/rust/scx_pandemonium/README.md:73:| Cores | EEVDF   | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+scheds/rust/scx_pandemonium/README.md:95:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+scheds/rust/scx_pandemonium/README.md:102:scx_bpfland keeps the dense-end edge here. ADAPTIVE app-launch dropped substantially across all core counts after the CPU-bound demotion fix removed long-runner head-of-queue contention.
+scheds/rust/scx_pandemonium/README.md:106:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+scheds/rust/scx_pandemonium/README.md:122:| scx_bpfland              | 23.04s | +40.6%    | 57M  | 0.42 |
+scheds/rust/scx_pandemonium/README.md:124:BPF and ADAPTIVE land within 0.1% of each other and ~40% ahead of scx_bpfland. ADAPTIVE actually edges out EEVDF on IPC (0.45 vs 0.44) despite the slightly longer wall-time, reflecting the cache-locality benefit from resistance affinity.
+scheds/rust/scx_pandemonium/README.md:135:| scx_lavd                 | 708.18J | 23.58W   | +2.1%    |
+scheds/rust/scx_pandemonium/README.md:136:| scx_bpfland              | 708.77J | 23.60W   | +2.2%    |
+scheds/rust/scx_pandemonium/README.md:149:| scx_bpfland              | 21.23s     | 1275.33J  | 221.41uJ   | +30.8%   |
+scheds/rust/scx_pandemonium/README.md:150:| scx_lavd                 | 25.85s     | 1617.79J  | 280.87uJ   | +65.9%   |
+scheds/rust/scx_pandemonium/README.md:419:sudo scx_pandemonium                            # Default: adaptive mode
+scheds/rust/scx_pandemonium/README.md:420:sudo scx_pandemonium --no-adaptive              # BPF-only (no Rust control loop)
+scheds/rust/scx_pandemonium/README.md:421:sudo scx_pandemonium --compositor gamescope     # Boost an additional compositor to LAT_CRITICAL
+scheds/rust/scx_pandemonium/README.md:422:sudo scx_pandemonium -v                         # Verbose telemetry on stdout
+scheds/rust/scx_pandemonium/README.md:487:Copies source into `scheds/rust/scx_pandemonium/`, renames the crate, replaces `build.rs` with `scx_cargo::BpfBuilder`, swaps `libbpf-cargo` for `scx_cargo`, registers the workspace member, and runs `cargo fmt`.
+tools/scxtop/tests/render_scheduler_tests.rs:51:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:88:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:162:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:199:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:234:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:264:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:301:                    scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:375:                    scheduler_name: "scx_rustland",
+tools/scxcash/src/monitors.rs:396:            .scx_layered_task_hint_map
+
+codex
+The scan also found top-level docs and service defaults that still describe the generic SCX tree and other schedulers. I’m checking package metadata and lockfile package names next, because a LAVD-only purge also needs workspace membership and generated lock entries considered.
+exec
+/usr/bin/bash -lc 'git ls-files services | sort' in /home/vi/animaschedext
+ succeeded in 0ms:
+services/README.md
+services/anima-hypr.service
+services/anima-scx-loader.conf
+services/anima.conf
+services/scx
+services/scx.service
+
+exec
+/usr/bin/bash -lc "rg -n '"'^name = "scx_(beerland|bpfland|cake|chaos|cosmos|flash|layered|mitosis|p2dq|pandemonium|rustland|rusty|tickless|flow|rlfifo|wd40|lavd|rustland_core)"'"' Cargo.lock" in /home/vi/animaschedext
+ succeeded in 0ms:
+3624:name = "scx_beerland"
+3664:name = "scx_bpfland"
+3682:name = "scx_cake"
+3728:name = "scx_chaos"
+3751:name = "scx_cosmos"
+3772:name = "scx_flash"
+3790:name = "scx_flow"
+3809:name = "scx_lavd"
+3842:name = "scx_layered"
+3878:name = "scx_mitosis"
+3907:name = "scx_p2dq"
+3933:name = "scx_pandemonium"
+3963:name = "scx_rlfifo"
+3978:name = "scx_rustland"
+4000:name = "scx_rustland_core"
+4012:name = "scx_rusty"
+4064:name = "scx_tickless"
+
+exec
+/usr/bin/bash -lc "git ls-files 'scheds/rust/scx_*' | awk -F/ '{count["'$3]++} END {for (p in count) print count[p], p}'"' | sort -k2" in /home/vi/animaschedext
+ succeeded in 0ms:
+11 scx_beerland
+11 scx_bpfland
+13 scx_cake
+14 scx_chaos
+11 scx_cosmos
+11 scx_flash
+27 scx_lavd
+41 scx_layered
+24 scx_mitosis
+15 scx_p2dq
+22 scx_pandemonium
+10 scx_rustland
+21 scx_rusty
+11 scx_tickless
+
+exec
+/usr/bin/bash -lc "for f in services/*; do printf '%s\\n' \""'$f"; sed -n '"'1,80p' \""'$f"; done' in /home/vi/animaschedext
+ succeeded in 0ms:
+services/README.md
+# A Quick Start Guide
+
+This guide provides instructions for running the SCX schedulers as a systemd service and checking its logs.
+
+## Getting Started
+
+At the very beginning, configure the /etc/default/scx file:
+
+- in the SCX_SCHEDULER variable, select the scheduler you are interested in
+
+- in the SCX_FLAGS variable, specify the flags you want to add. To do this, execute and read what flags you can add.
+
+```
+scx_SCHEDNAME --help
+```
+
+To start the SCX scheduler at boot, you need to run the systemd service as root. Here are the steps:
+
+
+- Enable the service:
+
+```
+systemctl enable scx.service
+```
+
+- Start the service:
+
+```
+systemctl start scx.service
+```
+
+Alternatively, you can use a shortened version of these commands:
+
+```
+systemctl enable --now scx.service
+```
+
+- To check the status of the service, use the following command:
+
+```
+systemctl status scx.service
+```
+
+## Override global configuration
+
+It is possible to override the global scx settings using systemd environment
+variables `SCX_SCHEDULER_OVERRIDE` and `SCX_FLAGS_OVERRIDE`.
+
+Example:
+
+```
+systemctl set-environment SCX_SCHEDULER_OVERRIDE=scx_rustland
+systemctl set-environment SCX_FLAGS_OVERRIDE="-s 10000"
+systemctl restart scx
+```
+
+If you want to restore the default value from the `/etc/default/scx` file execute:
+
+```
+systemctl unset-environment SCX_SCHEDULER_OVERRIDE
+systemctl unset-environment SCX_FLAGS_OVERRIDE
+systemctl restart scx
+```
+
+## Checking journald Logs
+
+
+- To view the logs, use the following command:
+
+```
+journalctl -u scx.service
+```
+
+- To view the logs of the current session use the command
+
+```
+journalctl -u scx.service -b 0
+```
+
+services/anima-hypr.service
+# SPDX-License-Identifier: GPL-2.0
+#
+# AnimaSchedEXT — Hyprland focus daemon (systemd USER service)
+#
+# Subscribes to Hyprland's activewindowv2 events and pushes the focused
+# PID into scx_lavd's pinned anima_active_pids BPF map. LAVD then gives
+# that PID the tightest virtual deadline (see anima.bpf.h).
+#
+# Why a user service (not a system service)?
+#   The daemon needs HYPRLAND_INSTANCE_SIGNATURE and XDG_RUNTIME_DIR to
+#   talk to the Hyprland IPC socket. These env vars are only present in
+#   the user's graphical session — a system service can't see them
+#   without ugly passthrough hacks. Plus the pins are chmod 666 so no
+#   root/CAP_BPF is required to update the maps.
+#
+# Install:
+#   install -Dm644 anima-hypr.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now anima-hypr.service
+#
+# Logs:
+#   journalctl --user -u anima-hypr.service -f
+
+[Unit]
+Description=AnimAIOS Hyprland focus daemon (scx_lavd boost)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# window+tree: boost focused PID + its low-CPU direct children. Switch to
+# just "window" if you want the focused process only (no descendants).
+ExecStart=/usr/local/bin/anima-hypr-daemon window+tree
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+services/anima-scx-loader.conf
+# Drop-in for scx_loader.service — swap in the AnimaSchedEXT build of
+# scx_lavd (the one that pins anima_active_pids for the focus daemon).
+#
+# Place at /etc/systemd/system/scx_loader.service.d/anima.conf
+
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/scx_lavd-anima --performance
+Restart=on-failure
+services/anima.conf
+# SPDX-License-Identifier: GPL-2.0
+#
+# tmpfiles.d snippet for AnimaSchedEXT
+#
+# Creates /run/anima on boot so the user daemon can bind its tab socket
+# without needing root. The directory is world-writable so any browser
+# native-messaging host (which runs as the user) can connect.
+#
+# Install:
+#   sudo install -Dm644 anima.conf /etc/tmpfiles.d/
+
+d /run/anima 0777 root root -
+services/scx
+# List of scx_schedulers: scx_beerland scx_bpfland scx_chaos scx_cosmos scx_flash scx_lavd scx_p2dq scx_rustland scx_rusty scx_tickless
+SCX_SCHEDULER=scx_cosmos
+
+# Set custom flags for each scheduler, below is an example of how to use
+SCX_FLAGS='-s 700 -S'
+services/scx.service
+[Unit]
+Description=Start scx_scheduler
+ConditionPathIsDirectory=/sys/kernel/sched_ext
+StartLimitIntervalSec=30
+StartLimitBurst=2
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/scx
+ExecStart=/bin/bash -c 'exec ${SCX_SCHEDULER_OVERRIDE:-$SCX_SCHEDULER} ${SCX_FLAGS_OVERRIDE:-$SCX_FLAGS} '
+Restart=on-failure
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+codex
+The remaining non-LAVD material is not limited to source directories; `services/scx` still defaults to `scx_cosmos`, and `Cargo.lock` still has package entries for every scheduler. I’m checking `scx_lavd`’s own manifest so the report can distinguish likely dependencies from removable workspace members.
+exec
+/usr/bin/bash -lc "sed -n '1,220p' scheds/rust/scx_lavd/Cargo.toml" in /home/vi/animaschedext
+ succeeded in 0ms:
+[package]
+name = "scx_lavd"
+version = "1.1.1"
+authors = ["Changwoo Min <changwoo@igalia.com>", "Igalia"]
+edition = "2021"
+description = "A Latency-criticality Aware Virtual Deadline (LAVD) scheduler based on sched_ext, which is a Linux kernel feature which enables implementing kernel thread schedulers in BPF and dynamically loading them. https://github.com/sched-ext/scx/tree/main"
+license = "GPL-2.0-only"
+
+[package.metadata.scx.ci.kernel]
+blocklist = [
+  "stable/6_12" # https://github.com/sched-ext/scx/issues/3046
+]
+
+[dependencies]
+scx_arena = { path = "../../../rust/scx_arena/scx_arena", version = "1.1.1" }
+anyhow = "1"
+bitvec = { version = "1", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
+clap_main = "0.2"
+clap-num = { version = "1" }
+crossbeam = "0.8"
+ctrlc = { version = "3", features = ["termination"] }
+hex = "0.4"
+itertools = "0.14"
+libbpf-rs = "=0.26.2"
+libc = "0.2"
+ordered-float = "5"
+scx_stats = { path = "../../../rust/scx_stats", version = "1.1.1" }
+scx_stats_derive = { path = "../../../rust/scx_stats/scx_stats_derive", version = "1.1.1" }
+scx_utils = { path = "../../../rust/scx_utils", version = "1.1.1", features = ["autopower"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "parking_lot", "tracing-log"] }
+static_assertions = "1"
+plain = "0.2"
+gpoint = "0.2"
+combinations = "0.1"
+rlimit = "0.11"
+nix = "0.31"
+
+[build-dependencies]
+scx_cargo = { path = "../../../rust/scx_cargo", version = "1.1.1" }
+
+[features]
+enable_backtrace = []
+
+exec
+/usr/bin/bash -lc "git ls-files tools | awk -F/ '{print "'$2}'"' | sort -u" in /home/vi/animaschedext
+ succeeded in 0ms:
+scxcash
+scxtop
+vmlinux_docify
+xtask
+
+exec
+/usr/bin/bash -lc "git ls-files rust | awk -F/ '{print "'$2}'"' | sort -u" in /home/vi/animaschedext
+ succeeded in 0ms:
+.gitignore
+scx_arena
+scx_bpf_compat
+scx_bpf_unittests
+scx_cargo
+scx_raw_pmu
+scx_rustland_core
+scx_stats
+scx_userspace_arena
+scx_utils
+
+exec
+/usr/bin/bash -lc "sed -n '1,180p' scheds/rust/scx_lavd/build.rs" in /home/vi/animaschedext
+ succeeded in 0ms:
+// Copyright (c) Changwoo Min <changwoo@igalia.com>
+//
+// This software may be used and distributed according to the terms of the
+// GNU General Public License version 2.
+
+fn main() {
+    scx_cargo::BpfBuilder::new()
+        .unwrap()
+        .enable_intf("src/bpf/intf.h", "bpf_intf.rs")
+        .enable_skel("src/bpf/main.bpf.c", "bpf")
+        .add_source("src/bpf/balance.bpf.c")
+        .add_source("src/bpf/idle.bpf.c")
+        .add_source("src/bpf/introspec.bpf.c")
+        .add_source("src/bpf/lat_cri.bpf.c")
+        .add_source("src/bpf/lock.bpf.c")
+        .add_source("src/bpf/power.bpf.c")
+        .add_source("src/bpf/preempt.bpf.c")
+        .add_source("src/bpf/sys_stat.bpf.c")
+        .add_source("src/bpf/util.bpf.c")
+        .add_source("src/bpf/lib/arena.bpf.c")
+        .add_source("src/bpf/lib/atq.bpf.c")
+        .add_source("src/bpf/lib/bitmap.bpf.c")
+        .add_source("src/bpf/lib/cgroup_bw.bpf.c")
+        .add_source("src/bpf/lib/cpumask.bpf.c")
+        .add_source("src/bpf/lib/rbtree.bpf.c")
+        .add_source("src/bpf/lib/minheap.bpf.c")
+        .add_source("src/bpf/lib/sdt_alloc.bpf.c")
+        .add_source("src/bpf/lib/sdt_task.bpf.c")
+        .add_source("src/bpf/lib/topology.bpf.c")
+        .add_source("src/bpf/lib/ravg.bpf.c")
+        .compile_link_gen()
+        .unwrap();
+}
+
+codex
+`scx_lavd` depends on shared Rust crates such as `scx_arena`, `scx_cargo`, `scx_stats`, and `scx_utils`, so those are not automatically deletion candidates. The clearly removable set is the other scheduler crates, experimental schedulers, and their docs/workspace references.
+exec
+/usr/bin/bash -lc 'git ls-files docs animatab scripts | sort' in /home/vi/animaschedext
+ succeeded in 0ms:
+animatab/anima-tab-host
+animatab/anima-tab-host.rs
+animatab/background.js
+animatab/manifest.json
+docs/2026-07-05-create-home-vi-animaschedext-agents-md-with-concise-contributor-guidelines-tailo.md
+docs/missions/audio-boost-review.log
+docs/missions/hypr-service-review.log
+scripts/bpftrace_stress_wrapper.sh
+scripts/cg_race.sh
+scripts/cg_setup_test.sh
+scripts/cg_stress.sh
+scripts/cgpath.sh
+scripts/dsq_lat.bt
+scripts/extract_bpf_objects.sh
+scripts/fixup_vmlinux_h.py
+scripts/freq_trace.bt
+scripts/gen_enum_defs.py
+scripts/gen_enums.py
+scripts/gen_vmlinux_h.sh
+scripts/process_runqlat.bt
+scripts/sched_ftrace.py
+scripts/scxtop.bt
+scripts/slicesnoop.bt
+scripts/vtime_dist.bt
+
+exec
+/usr/bin/bash -lc "for f in tools/*/Cargo.toml; do printf '%s\\n' \""'$f"; sed -n '"'1,80p' \""'$f"; done' in /home/vi/animaschedext
+ succeeded in 0ms:
+tools/scxcash/Cargo.toml
+[package]
+name = "scxcash"
+version = "1.1.1"
+edition = "2021"
+authors = ["Kumar Kartikeya Dwivedi <memxor@gmail.com>"]
+license = "GPL-2.0-only"
+repository = "https://github.com/sched-ext/scx"
+description = "Cache Usage Analyzer for sched_ext Schedulers"
+build = "build.rs"
+
+[package.metadata.veristat]
+disable = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
+log = "0.4"
+libc = "0.2"
+libbpf-rs = "=0.26.2"
+scx_utils = { path = "../../rust/scx_utils", version = "1.1.1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simplelog = "0.12"
+ctrlc = "3"
+num_cpus = "1"
+
+[build-dependencies]
+scx_cargo = { path = "../../rust/scx_cargo", version = "1.1.1" }
+tools/scxtop/Cargo.toml
+[package]
+name = "scxtop"
+version = "1.1.1"
+edition = "2021"
+authors = ["Daniel Hodges <hodges.daniel.scott@gmail.com>", "Yaakov Stein <ymstein14@gmail.com>"]
+license = "GPL-2.0-only"
+repository = "https://github.com/sched-ext/scx"
+description = "sched_ext scheduler tool for observability"
+
+[package.metadata.scx]
+ci.use_clippy = true
+
+[package.metadata.veristat]
+disable = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = [
+    "derive",
+    "cargo",
+    "wrap_help",
+    "unicode",
+    "string",
+    "unstable-styles",
+] }
+clap_complete = "4"
+crossterm = { version = "0.29", features = ["serde", "event-stream"] }
+futures = "0.3"
+glob = "0.3"
+libbpf-rs = "=0.26.2"
+libc = "0.2"
+log = "0.4"
+num-format = { version = "0.4", features = ["with-serde", "with-system-locale"] }
+perfetto_protos = "0.51"
+plain = "0.2"
+procfs = "0.18"
+protobuf = "3"
+rand = "0.10"
+ratatui = { version = "0.30", features = ["serde", "macros"] }
+regex = "1"
+scx_stats = { path = "../../rust/scx_stats", version = "1.1.1" }
+scx_utils = { path = "../../rust/scx_utils", version = "1.1.1" }
+simplelog = "0.12"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+signal-hook = "0.4"
+sysinfo = "0.38"
+tokio-util = "0.7"
+tokio = { version = "1", features = ["full"] }
+toml = "1"
+xdg = "3"
+log-panics = { version = "2", features = ["with-backtrace"]}
+hashbrown = "0.16"
+smartstring = { version = "1", features = ["serde"] }
+nix = { version = "0.31", features = ["time", "user"] }
+blazesym = "0.2"
+rayon = "1"
+
+[dev-dependencies]
+criterion = "0.8"
+tempfile = "3"
+
+[[bench]]
+name = "search_benchmark"
+harness = false
+
+[build-dependencies]
+scx_stats = { path = "../../rust/scx_stats", version = "1.1.1" }
+scx_cargo = { path = "../../rust/scx_cargo", version = "1.1.1" }
+tools/vmlinux_docify/Cargo.toml
+[package]
+name = "vmlinux_docify"
+version = "1.1.1"
+edition = "2021"
+authors = ["Pat S <patso@likewhatevs.io>"]
+description = "A tool to annotate vmlinux.h with documentation from kernel sources"
+
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+tools/xtask/Cargo.toml
+[package]
+name = "xtask"
+version = "1.1.1"
+edition = "2021"
+
+publish = false
+
+[package.metadata.scx]
+ci.use_clippy = true
+
+[dependencies]
+anyhow = "1"
+cargo_metadata = "0.23"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simplelog = "0.12"
+once_cell = "1"
+toml = "1"
+
+exec
+/usr/bin/bash -lc 'git status --short' in /home/vi/animaschedext
+ succeeded in 0ms:
+?? docs/missions/lavd-scope-audit.log
+
+exec
+/usr/bin/bash -lc 'rg -n "scx_(beerland|bpfland|cake|chaos|cosmos|flash|layered|mitosis|p2dq|pandemonium|rustland|rusty|tickless|flow|rlfifo|wd40)" README.md INSTALL.md OVERVIEW.md DEVELOPER_GUIDE.md CARGO_BUILD.md RELEASE.md UNIT_TESTING_GUIDE.md DHQ_README.md services scripts docs tools Cargo.toml' in /home/vi/animaschedext
+ succeeded in 0ms:
+UNIT_TESTING_GUIDE.md:35:A canonical example exists in `scheds/rust/scx_p2dq/src/bpf/main.test.bpf.c`.
+INSTALL.md:82:  services.scx.scheduler = "scx_lavd"; # default is "scx_rustland"
+INSTALL.md:105:$ sudo scx_rusty
+Cargo.toml:8:    "rust/scx_rustland_core",
+Cargo.toml:13:    "scheds/rust/scx_beerland",
+Cargo.toml:14:    "scheds/rust/scx_bpfland",
+Cargo.toml:15:    "scheds/rust/scx_cake",
+Cargo.toml:16:    "scheds/rust/scx_chaos",
+Cargo.toml:17:    "scheds/rust/scx_cosmos",
+Cargo.toml:18:    "scheds/rust/scx_flash",
+Cargo.toml:20:    "scheds/rust/scx_layered",
+Cargo.toml:21:    "scheds/rust/scx_mitosis",
+Cargo.toml:22:    "scheds/rust/scx_p2dq",
+Cargo.toml:23:    "scheds/rust/scx_pandemonium",
+Cargo.toml:24:    "scheds/rust/scx_rustland",
+Cargo.toml:25:    "scheds/rust/scx_rusty",
+Cargo.toml:26:    "scheds/rust/scx_tickless",
+Cargo.toml:27:    "scheds/experimental/scx_flow",
+Cargo.toml:28:    "scheds/experimental/scx_rlfifo",
+OVERVIEW.md:279:schedulers and `scx_rusty` scheduler, will be upstreamed as part of the kernel
+tools/scxcash/src/bpf/hints_tls.bpf.c:18:} scx_layered_task_hint_map SEC(".maps");
+tools/scxcash/src/bpf/hints_tls.bpf.c:33:	if (map != (void *)&scx_layered_task_hint_map)
+DHQ_README.md:709:### Real-World Impact (scx_p2dq Integration)
+DHQ_README.md:711:In scx_p2dq's LLC migration:
+DHQ_README.md:973:### DHQ Integration Pattern for scx_p2dq
+DHQ_README.md:1106:✅ **Complete**: Integration into scx_p2dq with LLC-to-strand mapping
+CARGO_BUILD.md:69:Example for **scx_flash** with **release-tiny**:
+CARGO_BUILD.md:72:cargo build --profile=release-tiny -p scx_flash
+CARGO_BUILD.md:81:| `scx_bpfland`  | `cargo build --release -p scx_bpfland` |
+CARGO_BUILD.md:82:| `scx_chaos`    | `cargo build --release -p scx_chaos` |
+CARGO_BUILD.md:83:| `scx_cosmos`   | `cargo build --release -p scx_cosmos` |
+CARGO_BUILD.md:84:| `scx_flash`    | `cargo build --release -p scx_flash` |
+CARGO_BUILD.md:86:| `scx_layered`  | `cargo build --release -p scx_layered` |
+CARGO_BUILD.md:87:| `scx_mitosis`  | `cargo build --release -p scx_mitosis` |
+CARGO_BUILD.md:88:| `scx_p2dq`     | `cargo build --release -p scx_p2dq` |
+CARGO_BUILD.md:89:| `scx_rlfifo`   | `cargo build --release -p scx_rlfifo` |
+CARGO_BUILD.md:90:| `scx_rustland` | `cargo build --release -p scx_rustland` |
+CARGO_BUILD.md:91:| `scx_rusty`    | `cargo build --release -p scx_rusty` |
+CARGO_BUILD.md:92:| `scx_tickless` | `cargo build --release -p scx_tickless` |
+CARGO_BUILD.md:93:| `scx_wd40`     | `cargo build --release -p scx_wd40` |
+CARGO_BUILD.md:130:| `scx_flash`  | `cargo install scx_flash`  |
+CARGO_BUILD.md:167:  cargo test -p scx_flash
+CARGO_BUILD.md:211:  sudo env RUST_BACKTRACE=1 ./target/debug/scx_flash
+CARGO_BUILD.md:217:  sudo env RUST_LOG=debug ./target/debug/scx_flash
+tools/scxcash/src/monitors.rs:396:            .scx_layered_task_hint_map
+RELEASE.md:129:$ cargo xtask bump-versions -p scx_lavd -p scx_layered
+services/scx:1:# List of scx_schedulers: scx_beerland scx_bpfland scx_chaos scx_cosmos scx_flash scx_lavd scx_p2dq scx_rustland scx_rusty scx_tickless
+services/scx:2:SCX_SCHEDULER=scx_cosmos
+services/README.md:52:systemctl set-environment SCX_SCHEDULER_OVERRIDE=scx_rustland
+tools/scxtop/tests/render_scheduler_tests.rs:51:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:88:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:162:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:199:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:234:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:264:                scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:301:                    scheduler_name: "scx_rustland",
+tools/scxtop/tests/render_scheduler_tests.rs:375:                    scheduler_name: "scx_rustland",
+tools/scxtop/MCP_INTEGRATIONS.md:219:- `scheduler_name` (optional): Specific scheduler to analyze (e.g., `scx_rusty`, `scx_lavd`)
+docs/missions/lavd-scope-audit.log:190:scx_beerland
+docs/missions/lavd-scope-audit.log:191:scx_bpfland
+docs/missions/lavd-scope-audit.log:192:scx_cake
+docs/missions/lavd-scope-audit.log:193:scx_chaos
+docs/missions/lavd-scope-audit.log:194:scx_cosmos
+docs/missions/lavd-scope-audit.log:195:scx_flash
+docs/missions/lavd-scope-audit.log:197:scx_layered
+docs/missions/lavd-scope-audit.log:198:scx_mitosis
+docs/missions/lavd-scope-audit.log:199:scx_p2dq
+docs/missions/lavd-scope-audit.log:200:scx_pandemonium
+docs/missions/lavd-scope-audit.log:201:scx_rustland
+docs/missions/lavd-scope-audit.log:202:scx_rusty
+docs/missions/lavd-scope-audit.log:203:scx_tickless
+docs/missions/lavd-scope-audit.log:331:    "rust/scx_rustland_core",
+docs/missions/lavd-scope-audit.log:336:    "scheds/rust/scx_beerland",
+docs/missions/lavd-scope-audit.log:337:    "scheds/rust/scx_bpfland",
+docs/missions/lavd-scope-audit.log:338:    "scheds/rust/scx_cake",
+docs/missions/lavd-scope-audit.log:339:    "scheds/rust/scx_chaos",
+docs/missions/lavd-scope-audit.log:340:    "scheds/rust/scx_cosmos",
+docs/missions/lavd-scope-audit.log:341:    "scheds/rust/scx_flash",
+docs/missions/lavd-scope-audit.log:343:    "scheds/rust/scx_layered",
+docs/missions/lavd-scope-audit.log:344:    "scheds/rust/scx_mitosis",
+docs/missions/lavd-scope-audit.log:345:    "scheds/rust/scx_p2dq",
+docs/missions/lavd-scope-audit.log:346:    "scheds/rust/scx_pandemonium",
+docs/missions/lavd-scope-audit.log:347:    "scheds/rust/scx_rustland",
+docs/missions/lavd-scope-audit.log:348:    "scheds/rust/scx_rusty",
+docs/missions/lavd-scope-audit.log:349:    "scheds/rust/scx_tickless",
+docs/missions/lavd-scope-audit.log:350:    "scheds/experimental/scx_flow",
+docs/missions/lavd-scope-audit.log:351:    "scheds/experimental/scx_rlfifo",
+docs/missions/lavd-scope-audit.log:388:scheds/experimental/scx_flow
+docs/missions/lavd-scope-audit.log:389:scheds/experimental/scx_flow/src
+docs/missions/lavd-scope-audit.log:390:scheds/experimental/scx_rlfifo
+docs/missions/lavd-scope-audit.log:391:scheds/experimental/scx_rlfifo/src
+docs/missions/lavd-scope-audit.log:392:scheds/experimental/scx_rlfifo/veristat
+docs/missions/lavd-scope-audit.log:393:scheds/experimental/scx_wd40
+docs/missions/lavd-scope-audit.log:394:scheds/experimental/scx_wd40/src
+docs/missions/lavd-scope-audit.log:402:scheds/rust/scx_beerland
+docs/missions/lavd-scope-audit.log:403:scheds/rust/scx_beerland/src
+docs/missions/lavd-scope-audit.log:404:scheds/rust/scx_beerland/veristat
+docs/missions/lavd-scope-audit.log:405:scheds/rust/scx_bpfland
+docs/missions/lavd-scope-audit.log:406:scheds/rust/scx_bpfland/src
+docs/missions/lavd-scope-audit.log:407:scheds/rust/scx_bpfland/veristat
+docs/missions/lavd-scope-audit.log:408:scheds/rust/scx_cake
+docs/missions/lavd-scope-audit.log:409:scheds/rust/scx_cake/.cargo
+docs/missions/lavd-scope-audit.log:410:scheds/rust/scx_cake/src
+docs/missions/lavd-scope-audit.log:411:scheds/rust/scx_cake/veristat
+docs/missions/lavd-scope-audit.log:412:scheds/rust/scx_chaos
+docs/missions/lavd-scope-audit.log:413:scheds/rust/scx_chaos/src
+docs/missions/lavd-scope-audit.log:414:scheds/rust/scx_chaos/veristat
+docs/missions/lavd-scope-audit.log:415:scheds/rust/scx_cosmos
+docs/missions/lavd-scope-audit.log:416:scheds/rust/scx_cosmos/src
+docs/missions/lavd-scope-audit.log:417:scheds/rust/scx_cosmos/veristat
+docs/missions/lavd-scope-audit.log:418:scheds/rust/scx_flash
+docs/missions/lavd-scope-audit.log:419:scheds/rust/scx_flash/src
+docs/missions/lavd-scope-audit.log:420:scheds/rust/scx_flash/veristat
+docs/missions/lavd-scope-audit.log:425:scheds/rust/scx_layered
+docs/missions/lavd-scope-audit.log:426:scheds/rust/scx_layered/examples
+docs/missions/lavd-scope-audit.log:427:scheds/rust/scx_layered/integration
+docs/missions/lavd-scope-audit.log:428:scheds/rust/scx_layered/src
+docs/missions/lavd-scope-audit.log:429:scheds/rust/scx_layered/veristat
+docs/missions/lavd-scope-audit.log:430:scheds/rust/scx_mitosis
+docs/missions/lavd-scope-audit.log:431:scheds/rust/scx_mitosis/src
+docs/missions/lavd-scope-audit.log:432:scheds/rust/scx_mitosis/test
+docs/missions/lavd-scope-audit.log:433:scheds/rust/scx_mitosis/veristat
+docs/missions/lavd-scope-audit.log:434:scheds/rust/scx_p2dq
+docs/missions/lavd-scope-audit.log:435:scheds/rust/scx_p2dq/src
+docs/missions/lavd-scope-audit.log:436:scheds/rust/scx_p2dq/veristat
+docs/missions/lavd-scope-audit.log:437:scheds/rust/scx_pandemonium
+docs/missions/lavd-scope-audit.log:438:scheds/rust/scx_pandemonium/src
+docs/missions/lavd-scope-audit.log:439:scheds/rust/scx_pandemonium/veristat
+docs/missions/lavd-scope-audit.log:440:scheds/rust/scx_rustland
+docs/missions/lavd-scope-audit.log:441:scheds/rust/scx_rustland/src
+docs/missions/lavd-scope-audit.log:442:scheds/rust/scx_rustland/veristat
+docs/missions/lavd-scope-audit.log:443:scheds/rust/scx_rusty
+docs/missions/lavd-scope-audit.log:444:scheds/rust/scx_rusty/src
+docs/missions/lavd-scope-audit.log:445:scheds/rust/scx_rusty/veristat
+docs/missions/lavd-scope-audit.log:446:scheds/rust/scx_tickless
+docs/missions/lavd-scope-audit.log:447:scheds/rust/scx_tickless/src
+docs/missions/lavd-scope-audit.log:448:scheds/rust/scx_tickless/veristat
+docs/missions/lavd-scope-audit.log:461:scheds/rust/scx_beerland/Cargo.toml
+docs/missions/lavd-scope-audit.log:462:scheds/rust/scx_beerland/README.md
+docs/missions/lavd-scope-audit.log:463:scheds/rust/scx_bpfland/Cargo.toml
+docs/missions/lavd-scope-audit.log:464:scheds/rust/scx_bpfland/README.md
+docs/missions/lavd-scope-audit.log:465:scheds/rust/scx_cake/Cargo.toml
+docs/missions/lavd-scope-audit.log:466:scheds/rust/scx_cake/README.md
+docs/missions/lavd-scope-audit.log:467:scheds/rust/scx_chaos/Cargo.toml
+docs/missions/lavd-scope-audit.log:468:scheds/rust/scx_chaos/README.md
+docs/missions/lavd-scope-audit.log:469:scheds/rust/scx_cosmos/Cargo.toml
+docs/missions/lavd-scope-audit.log:470:scheds/rust/scx_cosmos/README.md
+docs/missions/lavd-scope-audit.log:471:scheds/rust/scx_flash/Cargo.toml
+docs/missions/lavd-scope-audit.log:472:scheds/rust/scx_flash/README.md
+docs/missions/lavd-scope-audit.log:475:scheds/rust/scx_layered/Cargo.toml
+docs/missions/lavd-scope-audit.log:476:scheds/rust/scx_layered/README.md
+docs/missions/lavd-scope-audit.log:477:scheds/rust/scx_mitosis/Cargo.toml
+docs/missions/lavd-scope-audit.log:478:scheds/rust/scx_mitosis/README.md
+docs/missions/lavd-scope-audit.log:479:scheds/rust/scx_p2dq/Cargo.toml
+docs/missions/lavd-scope-audit.log:480:scheds/rust/scx_p2dq/README.md
+docs/missions/lavd-scope-audit.log:481:scheds/rust/scx_pandemonium/Cargo.toml
+docs/missions/lavd-scope-audit.log:482:scheds/rust/scx_pandemonium/README.md
+docs/missions/lavd-scope-audit.log:483:scheds/rust/scx_rustland/Cargo.toml
+docs/missions/lavd-scope-audit.log:484:scheds/rust/scx_rustland/README.md
+docs/missions/lavd-scope-audit.log:485:scheds/rust/scx_rusty/Cargo.toml
+docs/missions/lavd-scope-audit.log:486:scheds/rust/scx_rusty/README.md
+docs/missions/lavd-scope-audit.log:487:scheds/rust/scx_tickless/Cargo.toml
+docs/missions/lavd-scope-audit.log:488:scheds/rust/scx_tickless/README.md
+docs/missions/lavd-scope-audit.log:548:- [scx_beerland](scx_beerland/README.md)
+docs/missions/lavd-scope-audit.log:549:- [scx_bpfland](scx_bpfland/README.md)
+docs/missions/lavd-scope-audit.log:550:- [scx_flash](scx_flash/README.md)
+docs/missions/lavd-scope-audit.log:551:- [scx_cake](scx_cake/README.md)
+docs/missions/lavd-scope-audit.log:552:- [scx_chaos](scx_chaos/README.md)
+docs/missions/lavd-scope-audit.log:553:- [scx_cosmos](scx_cosmos/README.md)
+docs/missions/lavd-scope-audit.log:555:- [scx_layered](scx_layered/README.md)
+docs/missions/lavd-scope-audit.log:556:- [scx_mitosis](scx_mitosis/README.md)
+docs/missions/lavd-scope-audit.log:557:- [scx_pandemonium](scx_pandemonium/README.md)
+docs/missions/lavd-scope-audit.log:558:- [scx_p2dq](scx_p2dq/README.md)
+docs/missions/lavd-scope-audit.log:559:- [scx_rustland](scx_rustland/README.md)
+docs/missions/lavd-scope-audit.log:560:- [scx_rusty](scx_rusty/README.md)
+docs/missions/lavd-scope-audit.log:561:- [scx_tickless](scx_tickless/README.md)
+docs/missions/lavd-scope-audit.log:568:scheds/experimental/scx_flow
+docs/missions/lavd-scope-audit.log:569:scheds/experimental/scx_rlfifo
+docs/missions/lavd-scope-audit.log:570:scheds/experimental/scx_wd40
+docs/missions/lavd-scope-audit.log:636:systemctl set-environment SCX_SCHEDULER_OVERRIDE=scx_rustland
+docs/missions/lavd-scope-audit.log:709:tools/scxtop/src/bpf/intf.h:23:   * (https://github.com/sched-ext/scx/blob/main/scheds/rust/scx_layered/src/bpf/main.bpf.c#L577).
+docs/missions/lavd-scope-audit.log:736:scheds/experimental/scx_wd40/README.md:1:# scx_wd40
+docs/missions/lavd-scope-audit.log:737:scheds/experimental/scx_wd40/README.md:3:An experimental fork of the `scx_rusty` scheduler that uses BPF arenas to simplify scheduler development. Found in the main [`sched_ext`](https://github.com/sched-ext/scx/tree/main) repository. [Read more about `sched_ext`](https://github.com/sched-ext/scx/tree/main).
+docs/missions/lavd-scope-audit.log:738:scheds/rust/scx_pandemonium/README.md:7:PANDEMONIUM is included in the [sched-ext/scx](https://github.com/sched-ext/scx) project alongside scx_rusty, scx_lavd, scx_cosmos, scx_cake and the rest of the sched_ext family. Thank you to Piotr Gorski and the sched-ext team. PANDEMONIUM is made possible by contributions from the sched_ext, CachyOS, Gentoo, OpenSUSE, Arch and Ubuntu communities within the Linux ecosystem.
+docs/missions/lavd-scope-audit.log:739:scheds/rust/scx_pandemonium/README.md:11:12 AMD Zen CPUs, kernel 6.18+, clang 21. The tables below report v5.8.0 PANDEMONIUM numbers from a single-iteration bench-scale run across 2C/4C/8C/12C; the v5.9.0 deltas at 12C are summarized in the next subsection. EEVDF and scx_bpfland baselines are best-3-of-N historical (28 and 26 complete runs across 75 bench-scale sessions) — those baselines don't drift across PANDEMONIUM versions. v5.8.0 closed the 2C structural starvation class via the rescue-fairness fix and the missing CPU-bound demotion in stopping() that was leaving long-runners stuck at TIER_INTERACTIVE (longrun WORST 19s -> 13ms at 2C, mixed WORST 29s -> 16ms at 2C). Bench-fork-thread lands within 1% of EEVDF and ~40% ahead of scx_bpfland.
+docs/missions/lavd-scope-audit.log:740:scheds/rust/scx_pandemonium/README.md:29:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+docs/missions/lavd-scope-audit.log:741:scheds/rust/scx_pandemonium/README.md:40:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+docs/missions/lavd-scope-audit.log:742:scheds/rust/scx_pandemonium/README.md:47:Both modes beat EEVDF and scx_bpfland by a wide margin. Burst-storm cost is workload-sensitive across iterations.
+docs/missions/lavd-scope-audit.log:743:scheds/rust/scx_pandemonium/README.md:51:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+docs/missions/lavd-scope-audit.log:744:scheds/rust/scx_pandemonium/README.md:62:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+docs/missions/lavd-scope-audit.log:745:scheds/rust/scx_pandemonium/README.md:73:| Cores | EEVDF   | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+docs/missions/lavd-scope-audit.log:746:scheds/rust/scx_pandemonium/README.md:95:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+docs/missions/lavd-scope-audit.log:747:scheds/rust/scx_pandemonium/README.md:102:scx_bpfland keeps the dense-end edge here. ADAPTIVE app-launch dropped substantially across all core counts after the CPU-bound demotion fix removed long-runner head-of-queue contention.
+docs/missions/lavd-scope-audit.log:748:scheds/rust/scx_pandemonium/README.md:106:| Cores | EEVDF    | scx_bpfland | PANDEMONIUM (BPF) | PANDEMONIUM (ADAPTIVE) |
+docs/missions/lavd-scope-audit.log:749:scheds/rust/scx_pandemonium/README.md:122:| scx_bpfland              | 23.04s | +40.6%    | 57M  | 0.42 |
+docs/missions/lavd-scope-audit.log:750:scheds/rust/scx_pandemonium/README.md:124:BPF and ADAPTIVE land within 0.1% of each other and ~40% ahead of scx_bpfland. ADAPTIVE actually edges out EEVDF on IPC (0.45 vs 0.44) despite the slightly longer wall-time, reflecting the cache-locality benefit from resistance affinity.
+docs/missions/lavd-scope-audit.log:751:scheds/rust/scx_pandemonium/README.md:135:| scx_lavd                 | 708.18J | 23.58W   | +2.1%    |
+docs/missions/lavd-scope-audit.log:752:scheds/rust/scx_pandemonium/README.md:136:| scx_bpfland              | 708.77J | 23.60W   | +2.2%    |
+docs/missions/lavd-scope-audit.log:753:scheds/rust/scx_pandemonium/README.md:149:| scx_bpfland              | 21.23s     | 1275.33J  | 221.41uJ   | +30.8%   |
+docs/missions/lavd-scope-audit.log:754:scheds/rust/scx_pandemonium/README.md:150:| scx_lavd                 | 25.85s     | 1617.79J  | 280.87uJ   | +65.9%   |
+docs/missions/lavd-scope-audit.log:755:scheds/rust/scx_pandemonium/README.md:419:sudo scx_pandemonium                            # Default: adaptive mode
+docs/missions/lavd-scope-audit.log:756:scheds/rust/scx_pandemonium/README.md:420:sudo scx_pandemonium --no-adaptive              # BPF-only (no Rust control loop)
+docs/missions/lavd-scope-audit.log:757:scheds/rust/scx_pandemonium/README.md:421:sudo scx_pandemonium --compositor gamescope     # Boost an additional compositor to LAT_CRITICAL
+docs/missions/lavd-scope-audit.log:758:scheds/rust/scx_pandemonium/README.md:422:sudo scx_pandemonium -v                         # Verbose telemetry on stdout
+docs/missions/lavd-scope-audit.log:759:scheds/rust/scx_pandemonium/README.md:487:Copies source into `scheds/rust/scx_pandemonium/`, renames the crate, replaces `build.rs` with `scx_cargo::BpfBuilder`, swaps `libbpf-cargo` for `scx_cargo`, registers the workspace member, and runs `cargo fmt`.
+docs/missions/lavd-scope-audit.log:760:tools/scxtop/tests/render_scheduler_tests.rs:51:                scheduler_name: "scx_rustland",
+docs/missions/lavd-scope-audit.log:761:tools/scxtop/tests/render_scheduler_tests.rs:88:                scheduler_name: "scx_rustland",
+docs/missions/lavd-scope-audit.log:762:tools/scxtop/tests/render_scheduler_tests.rs:162:                scheduler_name: "scx_rustland",
+docs/missions/lavd-scope-audit.log:763:tools/scxtop/tests/render_scheduler_tests.rs:199:                scheduler_name: "scx_rustland",
+docs/missions/lavd-scope-audit.log:764:tools/scxtop/tests/render_scheduler_tests.rs:234:                scheduler_name: "scx_rustland",
+docs/missions/lavd-scope-audit.log:765:tools/scxtop/tests/render_scheduler_tests.rs:264:                scheduler_name: "scx_rustland",
+docs/missions/lavd-scope-audit.log:766:tools/scxtop/tests/render_scheduler_tests.rs:301:                    scheduler_name: "scx_rustland",
+docs/missions/lavd-scope-audit.log:767:tools/scxtop/tests/render_scheduler_tests.rs:375:                    scheduler_name: "scx_rustland",
+docs/missions/lavd-scope-audit.log:768:tools/scxcash/src/monitors.rs:396:            .scx_layered_task_hint_map
+docs/missions/lavd-scope-audit.log:785:3624:name = "scx_beerland"
+docs/missions/lavd-scope-audit.log:786:3664:name = "scx_bpfland"
+docs/missions/lavd-scope-audit.log:787:3682:name = "scx_cake"
+docs/missions/lavd-scope-audit.log:788:3728:name = "scx_chaos"
+docs/missions/lavd-scope-audit.log:789:3751:name = "scx_cosmos"
+docs/missions/lavd-scope-audit.log:790:3772:name = "scx_flash"
+docs/missions/lavd-scope-audit.log:791:3790:name = "scx_flow"
+docs/missions/lavd-scope-audit.log:793:3842:name = "scx_layered"
+docs/missions/lavd-scope-audit.log:794:3878:name = "scx_mitosis"
+docs/missions/lavd-scope-audit.log:795:3907:name = "scx_p2dq"
+docs/missions/lavd-scope-audit.log:796:3933:name = "scx_pandemonium"
+docs/missions/lavd-scope-audit.log:797:3963:name = "scx_rlfifo"
+docs/missions/lavd-scope-audit.log:798:3978:name = "scx_rustland"
+docs/missions/lavd-scope-audit.log:799:4000:name = "scx_rustland_core"
+docs/missions/lavd-scope-audit.log:800:4012:name = "scx_rusty"
+docs/missions/lavd-scope-audit.log:801:4064:name = "scx_tickless"
+docs/missions/lavd-scope-audit.log:806:11 scx_beerland
+docs/missions/lavd-scope-audit.log:807:11 scx_bpfland
+docs/missions/lavd-scope-audit.log:808:13 scx_cake
+docs/missions/lavd-scope-audit.log:809:14 scx_chaos
+docs/missions/lavd-scope-audit.log:810:11 scx_cosmos
+docs/missions/lavd-scope-audit.log:811:11 scx_flash
+docs/missions/lavd-scope-audit.log:813:41 scx_layered
+docs/missions/lavd-scope-audit.log:814:24 scx_mitosis
+docs/missions/lavd-scope-audit.log:815:15 scx_p2dq
+docs/missions/lavd-scope-audit.log:816:22 scx_pandemonium
+docs/missions/lavd-scope-audit.log:817:10 scx_rustland
+docs/missions/lavd-scope-audit.log:818:21 scx_rusty
+docs/missions/lavd-scope-audit.log:819:11 scx_tickless
+docs/missions/lavd-scope-audit.log:876:systemctl set-environment SCX_SCHEDULER_OVERRIDE=scx_rustland
+docs/missions/lavd-scope-audit.log:967:# List of scx_schedulers: scx_beerland scx_bpfland scx_chaos scx_cosmos scx_flash scx_lavd scx_p2dq scx_rustland scx_rusty scx_tickless
+docs/missions/lavd-scope-audit.log:968:SCX_SCHEDULER=scx_cosmos
+docs/missions/lavd-scope-audit.log:990:The remaining non-LAVD material is not limited to source directories; `services/scx` still defaults to `scx_cosmos`, and `Cargo.lock` still has package entries for every scheduler. I’m checking `scx_lavd`’s own manifest so the report can distinguish likely dependencies from removable workspace members.
+docs/missions/lavd-scope-audit.log:1058:scx_rustland_core
+tools/scxtop/src/cli.rs:74:    /// Show scx_layered data (process level layer_id's)
+tools/scxtop/src/cli.rs:152:    /// Show scx_layered data (process level layer_id's).
+tools/scxtop/CLAUDE_INTEGRATION.md:77:- Active Scheduler: scx_rusty (sched_ext)
+tools/scxtop/CLAUDE_INTEGRATION.md:115:2. Adjust scheduler layer weights if using scx_layered
+tools/scxtop/CLAUDE_INTEGRATION.md:172:   - Current scheduler (scx_rusty) is optimizing for latency
+tools/scxtop/CLAUDE_INTEGRATION.md:268:5. scx_bpf_dispatch (3.8%, [scx_rusty])
+tools/scxtop/docs/PERFETTO_TRACE_ANALYSIS.md:199:  "scheduler_name": "scx_rusty",
+tools/scxtop/src/bpf/intf.h:23:   * (https://github.com/sched-ext/scx/blob/main/scheds/rust/scx_layered/src/bpf/main.bpf.c#L577).
+
+codex
+**Audit Result**
+
+This repo has **not** been purged to LAVD-only content.
+
+Obvious non-LAVD scheduler components still tracked:
+
+- `scheds/rust/scx_beerland`
+- `scheds/rust/scx_bpfland`
+- `scheds/rust/scx_cake`
+- `scheds/rust/scx_chaos`
+- `scheds/rust/scx_cosmos`
+- `scheds/rust/scx_flash`
+- `scheds/rust/scx_layered`
+- `scheds/rust/scx_mitosis`
+- `scheds/rust/scx_p2dq`
+- `scheds/rust/scx_pandemonium`
+- `scheds/rust/scx_rustland`
+- `scheds/rust/scx_rusty`
+- `scheds/rust/scx_tickless`
+- `scheds/experimental/scx_flow`
+- `scheds/experimental/scx_rlfifo`
+- `scheds/experimental/scx_wd40`
+
+Workspace/config still includes them in [Cargo.toml](/home/vi/animaschedext/Cargo.toml:13), and [Cargo.lock](/home/vi/animaschedext/Cargo.lock:3624) still has package entries for the removed candidates.
+
+Other obvious non-LAVD leftovers:
+
+- [scheds/rust/README.md](/home/vi/animaschedext/scheds/rust/README.md:15) lists all Rust schedulers.
+- [services/scx](/home/vi/animaschedext/services/scx:1) lists many schedulers and defaults to `scx_cosmos`.
+- [services/README.md](/home/vi/animaschedext/services/README.md:52) documents generic SCX service usage and `scx_rustland`.
+- [CARGO_BUILD.md](/home/vi/animaschedext/CARGO_BUILD.md:69), [UNIT_TESTING_GUIDE.md](/home/vi/animaschedext/UNIT_TESTING_GUIDE.md:35), [DHQ_README.md](/home/vi/animaschedext/DHQ_README.md:709), [RELEASE.md](/home/vi/animaschedext/RELEASE.md:129), and parts of [INSTALL.md](/home/vi/animaschedext/INSTALL.md:105) reference non-LAVD schedulers.
+- `tools/scxcash` is visibly `scx_layered`-oriented in its BPF map naming.
+- `tools/scxtop` is generic sched_ext tooling with examples/tests referencing `scx_rusty` and `scx_layered`.
+
+If the fork should focus only on `scx_lavd` / anima LAVD, deletion would likely include the non-LAVD scheduler directories above, removal of their workspace members from `Cargo.toml`, regenerating `Cargo.lock`, and pruning or rewriting generic SCX docs/services/tooling so only `scx_lavd`, `scx_lavd-anima`, `anima-hypr-daemon`, and `animatab` remain.
+
+I would not blindly delete shared infrastructure yet: `scx_lavd` directly depends on `rust/scx_arena`, `rust/scx_cargo`, `rust/scx_stats`, `rust/scx_stats_derive`, and `rust/scx_utils`; `scheds/include` and `scheds/vmlinux` also look like shared BPF/kernel build support.
+
+No intentional file edits were made. `git status --short` shows an untracked `docs/missions/lavd-scope-audit.log`, which appears to be session logging rather than a source edit.
+tokens used
+58,567
+**Audit Result**
+
+This repo has **not** been purged to LAVD-only content.
+
+Obvious non-LAVD scheduler components still tracked:
+
+- `scheds/rust/scx_beerland`
+- `scheds/rust/scx_bpfland`
+- `scheds/rust/scx_cake`
+- `scheds/rust/scx_chaos`
+- `scheds/rust/scx_cosmos`
+- `scheds/rust/scx_flash`
+- `scheds/rust/scx_layered`
+- `scheds/rust/scx_mitosis`
+- `scheds/rust/scx_p2dq`
+- `scheds/rust/scx_pandemonium`
+- `scheds/rust/scx_rustland`
+- `scheds/rust/scx_rusty`
+- `scheds/rust/scx_tickless`
+- `scheds/experimental/scx_flow`
+- `scheds/experimental/scx_rlfifo`
+- `scheds/experimental/scx_wd40`
+
+Workspace/config still includes them in [Cargo.toml](/home/vi/animaschedext/Cargo.toml:13), and [Cargo.lock](/home/vi/animaschedext/Cargo.lock:3624) still has package entries for the removed candidates.
+
+Other obvious non-LAVD leftovers:
+
+- [scheds/rust/README.md](/home/vi/animaschedext/scheds/rust/README.md:15) lists all Rust schedulers.
+- [services/scx](/home/vi/animaschedext/services/scx:1) lists many schedulers and defaults to `scx_cosmos`.
+- [services/README.md](/home/vi/animaschedext/services/README.md:52) documents generic SCX service usage and `scx_rustland`.
+- [CARGO_BUILD.md](/home/vi/animaschedext/CARGO_BUILD.md:69), [UNIT_TESTING_GUIDE.md](/home/vi/animaschedext/UNIT_TESTING_GUIDE.md:35), [DHQ_README.md](/home/vi/animaschedext/DHQ_README.md:709), [RELEASE.md](/home/vi/animaschedext/RELEASE.md:129), and parts of [INSTALL.md](/home/vi/animaschedext/INSTALL.md:105) reference non-LAVD schedulers.
+- `tools/scxcash` is visibly `scx_layered`-oriented in its BPF map naming.
+- `tools/scxtop` is generic sched_ext tooling with examples/tests referencing `scx_rusty` and `scx_layered`.
+
+If the fork should focus only on `scx_lavd` / anima LAVD, deletion would likely include the non-LAVD scheduler directories above, removal of their workspace members from `Cargo.toml`, regenerating `Cargo.lock`, and pruning or rewriting generic SCX docs/services/tooling so only `scx_lavd`, `scx_lavd-anima`, `anima-hypr-daemon`, and `animatab` remain.
+
+I would not blindly delete shared infrastructure yet: `scx_lavd` directly depends on `rust/scx_arena`, `rust/scx_cargo`, `rust/scx_stats`, `rust/scx_stats_derive`, and `rust/scx_utils`; `scheds/include` and `scheds/vmlinux` also look like shared BPF/kernel build support.
+
+No intentional file edits were made. `git status --short` shows an untracked `docs/missions/lavd-scope-audit.log`, which appears to be session logging rather than a source edit.

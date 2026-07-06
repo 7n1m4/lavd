@@ -21,10 +21,11 @@ use glob::glob;
 use num::clamp;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, Ord, PartialOrd)]
 pub struct PerfState {
     pub cost: usize,
     pub frequency: usize,
@@ -33,7 +34,7 @@ pub struct PerfState {
     pub power: usize,
 }
 
-#[derive(Debug, Clone, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Eq, Ord, PartialOrd)]
 pub struct PerfDomain {
     /// Monotonically increasing unique id.
     pub id: usize,
@@ -136,6 +137,14 @@ impl PartialEq for PerfDomain {
     }
 }
 
+impl Hash for PerfDomain {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.span.hash(state);
+        self.perf_table.hash(state);
+    }
+}
+
 impl PerfState {
     /// Build a PerfState
     pub fn new(root: String) -> Result<PerfState> {
@@ -161,6 +170,15 @@ impl PartialEq for PerfState {
             && self.frequency == other.frequency
             && self.performance == other.performance
             && self.power == other.power
+    }
+}
+
+impl Hash for PerfState {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.cost.hash(state);
+        self.frequency.hash(state);
+        self.performance.hash(state);
+        self.power.hash(state);
     }
 }
 

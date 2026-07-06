@@ -8,8 +8,8 @@ else
 fi
 
 if command -v clang-format >/dev/null 2>&1; then
-    echo "Running clang-format on scx_mitosis"
-    for file in scheds/rust/scx_mitosis/src/bpf/*.c scheds/rust/scx_mitosis/src/bpf/*.h; do
+    echo "Running clang-format on scx_lavd BPF sources"
+    for file in scheds/rust/scx_lavd/src/bpf/*.c scheds/rust/scx_lavd/src/bpf/*.h; do
         [ -f "$file" ] && clang-format -i "$file"
     done
 else
@@ -19,4 +19,3 @@ fi
 git add $(git diff --name-only)
 
 exit 0
-

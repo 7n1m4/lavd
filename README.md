@@ -80,21 +80,20 @@ the deadline numerator to zero. Boost level is read from the
 ### Build
 
 ```bash
-cd scheds/rust/scx_lavd
 # main scheduler binary (replaces /usr/bin/scx_lavd)
-cargo build --release
-# userspace hyprland focus daemon
-cargo build --release --example anima_hypr_daemon
+cargo build --release -p scx_lavd
+# userspace Hyprland focus daemon
+cargo build --release --example anima_hypr_daemon -p scx_lavd
 ```
 
 Install:
 
 ```bash
 # Replace the default scx_lavd with our build
-sudo install -Dm755 ../../target/release/scx_lavd /usr/local/bin/scx_lavd-anima
+sudo install -Dm755 target/release/scx_lavd /usr/local/bin/scx_lavd-anima
 
 # Install the daemon binary
-sudo install -Dm755 ../../target/release/examples/anima_hypr_daemon \
+sudo install -Dm755 target/release/examples/anima_hypr_daemon \
                 /usr/local/bin/anima-hypr-daemon
 
 # Install unit files

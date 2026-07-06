@@ -79,7 +79,7 @@ recognizes the following user attribute:
 
 [`examples/stats_defs.rs.h`](./examples/stats_defs.rs.h) shows how the above
 attributes can be used. See
-[scx_layered](https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_layered/src/stats.rs)
+[`scx_lavd`](../../scheds/rust/scx_lavd/src/stats.rs)
 for practical usage.
 
 Note that scx_stats depends on [`serde`](https://crates.io/crates/serde) and

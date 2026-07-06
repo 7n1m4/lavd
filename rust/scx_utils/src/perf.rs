@@ -42,6 +42,7 @@ pub unsafe fn perf_event_open(
     }
 }
 
+#[allow(warnings)]
 pub mod bindings {
     include!(concat!(env!("OUT_DIR"), "/perf_bindings.rs"));
 }

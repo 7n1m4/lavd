@@ -541,15 +541,10 @@ fn main() -> Result<()> {
                 break;
             };
             let mut buf = [0u8; 4];
-            loop {
-                match s.read_exact(&mut buf) {
-                    Ok(()) => {
-                        let pid = i32::from_ne_bytes(buf);
-                        if pid > 0 {
-                            *active_tab_pid_for_thread.lock().unwrap() = Some(pid as u32);
-                        }
-                    }
-                    Err(_) => break, /* writer disconnected */
+            while let Ok(()) = s.read_exact(&mut buf) {
+                let pid = i32::from_ne_bytes(buf);
+                if pid > 0 {
+                    *active_tab_pid_for_thread.lock().unwrap() = Some(pid as u32);
                 }
             }
         }
@@ -646,9 +641,8 @@ fn main() -> Result<()> {
             .unwrap_or(false);
 
         let mut g = anima.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        if is_browser && tab_pid.is_some() {
-            let tp = tab_pid.unwrap();
-            if let Err(e) = g.update_browser(pid, tp) {
+        if let (true, Some(tab_pid)) = (is_browser, tab_pid) {
+            if let Err(e) = g.update_browser(pid, tab_pid) {
                 eprintln!("[anima] update_browser: {e}");
             }
         } else if let Err(e) = g.update_focused(pid, include_children) {
