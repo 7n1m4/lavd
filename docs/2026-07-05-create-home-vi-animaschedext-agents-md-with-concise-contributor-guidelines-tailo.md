@@ -1,0 +1,1 @@
+Create `/home/vi/animaschedext/AGENTS.md` with concise contributor guidelines tailored to AnimaSchedEXT. Sections: project structure, build/format commands (cargo fmt + build), Rust + eBPF style conventions, verification expectations (scheduler/BPF changes), contribution best practices (commits, PRs, security/runtime config). Target ~200-300 words.
