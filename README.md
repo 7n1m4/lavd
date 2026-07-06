@@ -1,14 +1,17 @@
 <div align=center>
 
-# [Anima](https://github.com/animaios/anima)SchedEXT
+# [Anima](https://github.com/animaios/anima)LAVD
 
 <img width="256" height="384" alt="AnimAIOS mascot" src="https://github.com/user-attachments/assets/6d6699ed-e61b-4e8a-8148-6d9ab4b36cef" />
+<br><br>
 
-[![ sched_ext](https://img.shields.io/badge/sched_ext-BPF_scheduler-orange)](https://github.com/sched-ext/scx)
-[![ Hyprland](https://img.shields.io/badge/Hyprland-aware-blueviolet)](https://hyprland.org)
-[![ License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+[![ Hyprland](https://img.shields.io/badge/Hyprland-compatible-blueviolet)](https://hyprland.org)
+[![DeepSource](https://app.deepsource.com/gh/animaios/animalavd.svg/?label=code+coverage&show_trend=true&token=hTeG3XzzElKjGvZdZ_zO7CaZ)](https://app.deepsource.com/gh/animaios/animalavd/)
 
-**AnimaSchedEXT** is a purpose-built fork of the
+[![DeepSource](https://app.deepsource.com/gh/animaios/animalavd.svg/?label=active+issues&show_trend=true&token=hTeG3XzzElKjGvZdZ_zO7CaZ)](https://app.deepsource.com/gh/animaios/animalavd/)
+[![DeepSource](https://app.deepsource.com/gh/animaios/animalavd.svg/?label=resolved+issues&show_trend=true&token=hTeG3XzzElKjGvZdZ_zO7CaZ)](https://app.deepsource.com/gh/animaios/animalavd/)
+
+**AnimaLAVD** is a purpose-built fork of the
 [scx_lavd](https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_lavd)
 (**L**atency-criticality **A**ware **V**irtual **D**eadline) scheduler from the
 [sched_ext](https://github.com/sched-ext/scx) project, tuned for the desktop
@@ -16,7 +19,7 @@ gamer and interactive power user.
 
 The core LAVD scheduler is already excellent at keeping the system responsive
 under load: it classifies tasks by communication behavior and gives the most
-urgent, latency-sensitive ones the tightest virtual deadlines. AnimaSchedEXT
+urgent, latency-sensitive ones the tightest virtual deadlines. AnimaLAVD
 adds one piece it was missing — awareness of which window is *actually focused
 in your window manager*.
 
@@ -247,7 +250,7 @@ only the PID that Hyprland currently considers focused.
 ## Repository structure
 
 ```
-anima-lavd-fork/
+animalavd/
 ├── scheds/rust/scx_lavd/
 │   ├── src/
 │   │   ├── bpf/
@@ -264,7 +267,7 @@ anima-lavd-fork/
 
 ### Upstream support
 
-AnimaSchedEXT patches land in two forms:
+AnimaLAVD patches land in two forms:
 
 - The **BPF patch** (everything in `src/bpf/`): merged into sched_ext's
   scx_lavd when the community agrees. Until then, this small fork keeps the
