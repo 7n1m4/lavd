@@ -18,10 +18,11 @@
 //! - Signal handlers so the pinned map is wiped on exit/crash/SIGTERM
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -52,6 +53,16 @@ const DEFAULT_CHILD_MAX_CPU: f64 = 0.5;
 /// that 1 Hz is plenty. Override with `ANIMA_SAMPLE_MILLIS`.
 const DEFAULT_SAMPLE_MILLIS: u64 = 1000;
 
+/* ── audio-PID boost constants ─────────────────────────────────────── */
+
+/// PipeWire/PulseAudio stream audio-PID boost. Default `on`.
+const AUDIO_BOOST_DEFAULT: &str = "on";
+/// Polling interval in milliseconds for sink-input enumeration. Override
+/// with `ANIMA_AUDIO_POLL_MS`. Default 1000.
+const AUDIO_POLL_MS_DEFAULT: u64 = 1000;
+/// Audio command. Override with `ANIMA_AUDIO_CMD`. Default `pactl`.
+const AUDIO_CMD_DEFAULT: &str = "pactl";
+
 /* ── data structures ───────────────────────────────────────────────── */
 
 /// PIDs in the BPF map + CPU accounting state for child-filtering.
@@ -60,6 +71,17 @@ struct Animamap {
     config_handle: MapHandle,
     last_keys: HashSet<u32>,
     cpu: CpuFilter,
+    boost: BoostState,
+}
+
+/// Tracks the desired boost set as the union of focus/browser state and
+/// active audio streams. Keeping these inputs separate lets audio polling
+/// reconcile the map without waiting for the next focus event.
+#[derive(Default)]
+struct BoostState {
+    base_keys: HashSet<u32>,
+    audio_pids: HashSet<u32>,
+    active_keys: HashSet<u32>,
 }
 
 /// Tracks per-PID CPU samples so we can filter heavy children out of the
@@ -79,6 +101,25 @@ struct Sample {
     when: Instant,
 }
 
+impl BoostState {
+    fn set_base_keys(&mut self, base_keys: HashSet<u32>) -> &HashSet<u32> {
+        self.base_keys = base_keys;
+        self.rebuild()
+    }
+
+    fn set_audio_pids(&mut self, audio_pids: HashSet<u32>) -> &HashSet<u32> {
+        self.audio_pids = audio_pids;
+        self.rebuild()
+    }
+
+    fn rebuild(&mut self) -> &HashSet<u32> {
+        self.active_keys.clear();
+        self.active_keys.extend(self.base_keys.iter().copied());
+        self.active_keys.extend(self.audio_pids.iter().copied());
+        &self.active_keys
+    }
+}
+
 impl Animamap {
     /// Open the pinned BPF maps. `MapHandle::from_pinned_path` is the
     /// canonical entry point in libbpf-rs 0.26.x for opening a pinned
@@ -87,10 +128,9 @@ impl Animamap {
     /// fails hard with a clear error instead of silently dropping
     /// updates.
     fn open() -> Result<Self> {
-        let handle = MapHandle::from_pinned_path(MAP_PIN_PATH)
-            .with_context(|| format!(
-                "cannot open pinned BPF map at {MAP_PIN_PATH} — is scx_lavd-anima running?"
-            ))?;
+        let handle = MapHandle::from_pinned_path(MAP_PIN_PATH).with_context(|| {
+            format!("cannot open pinned BPF map at {MAP_PIN_PATH} — is scx_lavd-anima running?")
+        })?;
         let config_handle = MapHandle::from_pinned_path(CONFIG_PIN_PATH)
             .with_context(|| format!(
                 "cannot open pinned BPF config map at {CONFIG_PIN_PATH} — is scx_lavd-anima running?"
@@ -104,6 +144,7 @@ impl Animamap {
                 DEFAULT_CHILD_MAX_CPU,
                 Duration::from_millis(DEFAULT_SAMPLE_MILLIS),
             ),
+            boost: BoostState::default(),
         })
     }
 
@@ -124,66 +165,60 @@ impl Animamap {
     /// back to `update_focused` when mode is inactive or no tab-PID has
     /// been seen yet.
     fn update_browser(&mut self, focused_pid: u32, tab_pid: u32) -> Result<()> {
-        let mut new_keys = HashSet::with_capacity(2);
-        new_keys.insert(focused_pid);
-        new_keys.insert(tab_pid);
+        let mut base_keys = HashSet::with_capacity(2);
+        base_keys.insert(focused_pid);
+        base_keys.insert(tab_pid);
 
-        // Delete stale keys.
-        for stale in self.last_keys.difference(&new_keys) {
-            if let Err(e) = self.handle.delete(&stale.to_le_bytes()) {
-                eprintln!("[anima] delete pid {stale}: {e}");
-            }
-        }
-
-        // Insert new keys.
-        for &key in &new_keys {
-            if let Err(e) = self
-                .handle
-                .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
-            {
-                return Err(anyhow::anyhow!("insert pid {key}: {e}"));
-            }
-        }
-
-        self.last_keys = new_keys;
+        let new_keys = self.boost.set_base_keys(base_keys).clone();
+        self.apply_active_keys(&new_keys)?;
         eprintln!("[anima] browser mode -> focused {focused_pid}, tab {tab_pid}");
         Ok(())
     }
 
     /// Push the focused PID (and optionally its direct children) into
     /// the map. Incremental: only deletes stale keys + inserts new keys.
-    fn update_focused(
-        &mut self,
-        focused_pid: u32,
-        include_children: bool,
-    ) -> Result<()> {
-        let mut new_keys: HashSet<u32> = HashSet::with_capacity(8);
-        new_keys.insert(focused_pid);
+    /// Also unions the current set of audio-PIDs so that any process
+    /// driving a PulseAudio/PipeWire sink-input gets the boost even if
+    /// it is not focused (e.g. Spotify while you type in a terminal).
+    fn update_focused(&mut self, focused_pid: u32, include_children: bool) -> Result<()> {
+        let mut base_keys: HashSet<u32> = HashSet::with_capacity(8);
+        base_keys.insert(focused_pid);
 
         if include_children {
-            self.cpu.filter_children(focused_pid, &mut new_keys);
+            self.cpu.filter_children(focused_pid, &mut base_keys);
         }
 
-        // Delete stale keys.
-        for stale in self.last_keys.difference(&new_keys) {
+        let n_children = base_keys.len().saturating_sub(1);
+        let new_keys = self.boost.set_base_keys(base_keys).clone();
+        self.apply_active_keys(&new_keys)?;
+        eprintln!("[anima] focused -> {focused_pid} ({n_children} children)");
+        Ok(())
+    }
+
+    /// Update audio-PIDs and reconcile the map immediately, without
+    /// waiting for a Hyprland focus event.
+    fn update_audio(&mut self, audio_pids: HashSet<u32>) -> Result<()> {
+        let new_keys = self.boost.set_audio_pids(audio_pids).clone();
+        self.apply_active_keys(&new_keys)
+    }
+
+    fn apply_active_keys(&mut self, new_keys: &HashSet<u32>) -> Result<()> {
+        for stale in self.last_keys.difference(new_keys) {
             if let Err(e) = self.handle.delete(&stale.to_le_bytes()) {
                 eprintln!("[anima] delete pid {stale}: {e}");
             }
         }
 
-        // Insert new keys.
-        for key in &new_keys {
-            if let Err(e) = self
-                .handle
-                .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
+        for key in new_keys {
+            if let Err(e) =
+                self.handle
+                    .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
             {
                 return Err(anyhow::anyhow!("insert pid {key}: {e}"));
             }
         }
 
-        let n = new_keys.len();
-        self.last_keys = new_keys;
-        eprintln!("[anima] focused -> {focused_pid} ({} children)", n - 1);
+        self.last_keys = new_keys.clone();
         Ok(())
     }
 
@@ -259,8 +294,7 @@ impl CpuFilter {
                     return 0.0;
                 }
                 let d = (cur.utime.saturating_sub(prev.utime)
-                    + cur.stime.saturating_sub(prev.stime))
-                    as f64;
+                    + cur.stime.saturating_sub(prev.stime)) as f64;
                 let ticks_per_sec = 100.0; /* sysconf(_SC_CLK_TCK) on x86_64 */
                 (d / ticks_per_sec) / dt
             }
@@ -337,6 +371,29 @@ fn read_comm(pid: u32) -> Option<String> {
     Some(s.trim().to_string())
 }
 
+/// Parse `pactl list sink-inputs` output and return the set of PIDs that
+/// currently own a sink-input (i.e. are actively playing audio via
+/// PulseAudio or PipeWire's pulse layer). Empty set when nothing is
+/// playing or when `pactl` is unavailable. Lines of interest look like:
+///     application.process.id = "12345"
+fn sample_audio(cmd: &str) -> io::Result<HashSet<u32>> {
+    let out = std::process::Command::new(cmd)
+        .args(["list", "sink-inputs"])
+        .output()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut set = HashSet::new();
+    for line in s.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("application.process.id") {
+            let v = rest.trim().trim_start_matches('=').trim().trim_matches('"');
+            if let Ok(pid) = v.parse::<u32>() {
+                set.insert(pid);
+            }
+        }
+    }
+    Ok(set)
+}
+
 /// Build an address → PID lookup table from `hyprctl clients -j`.
 fn build_pid_cache() -> Result<HashMap<u64, u32>> {
     let out = std::process::Command::new("hyprctl")
@@ -394,9 +451,42 @@ fn hypr_sock2() -> Result<PathBuf> {
     let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").map_err(|_| {
         anyhow::anyhow!("HYPRLAND_INSTANCE_SIGNATURE not set — is Hyprland running?")
     })?;
-    let xdg = std::env::var("XDG_RUNTIME_DIR")
-        .map_err(|_| anyhow::anyhow!("XDG_RUNTIME_DIR not set"))?;
+    let xdg =
+        std::env::var("XDG_RUNTIME_DIR").map_err(|_| anyhow::anyhow!("XDG_RUNTIME_DIR not set"))?;
     Ok(PathBuf::from(format!("{xdg}/hypr/{sig}/.socket2.sock")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pids(values: &[u32]) -> HashSet<u32> {
+        values.iter().copied().collect()
+    }
+
+    #[test]
+    fn audio_state_changes_rebuild_active_keys_without_focus_event() {
+        let mut state = BoostState::default();
+
+        let active = state.set_base_keys(pids(&[100])).clone();
+        assert_eq!(active, pids(&[100]));
+
+        let active = state.set_audio_pids(pids(&[200])).clone();
+        assert_eq!(active, pids(&[100, 200]));
+
+        let active = state.set_audio_pids(HashSet::new()).clone();
+        assert_eq!(active, pids(&[100]));
+    }
+
+    #[test]
+    fn browser_base_keys_include_audio_pids() {
+        let mut state = BoostState::default();
+
+        state.set_audio_pids(pids(&[300]));
+        let active = state.set_base_keys(pids(&[100, 200])).clone();
+
+        assert_eq!(active, pids(&[100, 200, 300]));
+    }
 }
 
 /* ── main event loop ───────────────────────────────────────────────── */
@@ -464,6 +554,50 @@ fn main() -> Result<()> {
             }
         }
     });
+
+    /* Audio-PID boost thread: poll `pactl list sink-inputs`, then
+     * reconcile the pinned map against current focus/browser keys plus
+     * active audio PIDs. Thread is skipped if ANIMA_AUDIO_BOOST=off. */
+    let anima_for_audio = Arc::clone(&anima);
+    let audio_raw =
+        std::env::var("ANIMA_AUDIO_BOOST").unwrap_or_else(|_| AUDIO_BOOST_DEFAULT.into());
+    let audio_enabled = !audio_raw.eq_ignore_ascii_case("off");
+    let audio_poll_ms: u64 = std::env::var("ANIMA_AUDIO_POLL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(AUDIO_POLL_MS_DEFAULT);
+    let audio_cmd: String =
+        std::env::var("ANIMA_AUDIO_CMD").unwrap_or_else(|_| AUDIO_CMD_DEFAULT.into());
+    if audio_enabled {
+        eprintln!("[anima] audio: poll thread started (cmd={audio_cmd}, poll_ms={audio_poll_ms})");
+        thread::spawn(move || {
+            let mut consecutive_empty = 0u32;
+            loop {
+                thread::sleep(Duration::from_millis(audio_poll_ms));
+                match sample_audio(&audio_cmd) {
+                    Ok(set) => {
+                        let is_empty = set.is_empty();
+                        if is_empty {
+                            consecutive_empty += 1;
+                            if consecutive_empty == 5 {
+                                eprintln!("[anima] audio: no active streams");
+                            }
+                        } else {
+                            consecutive_empty = 0;
+                        }
+                        if let Ok(mut g) = anima_for_audio.lock() {
+                            if let Err(e) = g.update_audio(set) {
+                                eprintln!("[anima] update_audio: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("[anima] audio: {e}"),
+                }
+            }
+        });
+    } else {
+        eprintln!("[anima] audio: poll thread disabled (ANIMA_AUDIO_BOOST={audio_raw})");
+    }
 
     let mut pid_cache = build_pid_cache()
         .inspect_err(|e| eprintln!("[anima] cache build failed: {e}"))

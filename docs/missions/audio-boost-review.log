@@ -1,0 +1,1139 @@
+Reading additional input from stdin...
+OpenAI Codex v0.142.5
+--------
+workdir: /home/vi/animaschedext
+model: gpt-5.5
+provider: anyrouter
+approval: never
+sandbox: read-only
+reasoning effort: medium
+reasoning summaries: none
+session id: 019f34d1-b877-7da3-92c5-7f886af683e0
+--------
+user
+Read AGENTS.md and review the current diff for scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs. Focus only on the audio boost review items: audio polling should update the pinned map without waiting for focus events, and browser-mode updates should preserve active audio PIDs. Do not modify files. Report whether the current diff addresses those issues, cite specific functions/lines, and mention any remaining risk or test gap.
+codex
+I’ll use the `using-superpowers` skill first because it is mandatory at conversation start, then I’ll inspect AGENTS.md and the diff without editing files.
+exec
+/usr/bin/bash -lc "sed -n '1,240p' /home/vi/.agents/skills/superpowers/using-superpowers/SKILL.md" in /home/vi/animaschedext
+ succeeded in 0ms:
+---
+name: using-superpowers
+description: Use when starting any conversation - establishes how to find and use skills, requiring skill invocation before ANY response including clarifying questions
+---
+
+<SUBAGENT-STOP>
+If you were dispatched as a subagent to execute a specific task, skip this skill.
+</SUBAGENT-STOP>
+
+<EXTREMELY-IMPORTANT>
+If you think there is even a 1% chance a skill might apply to what you are doing, you ABSOLUTELY MUST invoke the skill.
+
+IF A SKILL APPLIES TO YOUR TASK, YOU DO NOT HAVE A CHOICE. YOU MUST USE IT.
+
+This is not negotiable. This is not optional. You cannot rationalize your way out of this.
+</EXTREMELY-IMPORTANT>
+
+## Instruction Priority
+
+Superpowers skills override default system prompt behavior, but **user instructions always take precedence**:
+
+1. **User's explicit instructions** (CLAUDE.md, GEMINI.md, AGENTS.md, direct requests) — highest priority
+2. **Superpowers skills** — override default system behavior where they conflict
+3. **Default system prompt** — lowest priority
+
+If CLAUDE.md, GEMINI.md, or AGENTS.md says "don't use TDD" and a skill says "always use TDD," follow the user's instructions. The user is in control.
+
+## How to Access Skills
+
+**Never read skill files manually with file tools** — always use your platform's skill-loading mechanism so the skill is properly activated.
+
+**In Claude Code:** Use the `Skill` tool. When you invoke a skill, its content is loaded and presented to you — follow it directly.
+
+**In Codex:** Skills load natively. Follow the instructions presented when a skill activates.
+
+**In Copilot CLI:** Use the `skill` tool. Skills are auto-discovered from installed plugins.
+
+**In Gemini CLI:** Skills activate via the `activate_skill` tool. Gemini loads skill metadata at session start and activates the full content on demand.
+
+**In other environments:** Check your platform's documentation for how skills are loaded.
+
+## Platform Adaptation
+
+Skills speak in actions ("dispatch a subagent", "create a todo", "read a file") rather than naming any one runtime's tools. For per-platform tool equivalents and instructions-file conventions, see [claude-code-tools.md](references/claude-code-tools.md), [codex-tools.md](references/codex-tools.md), [copilot-tools.md](references/copilot-tools.md), [gemini-tools.md](references/gemini-tools.md), [pi-tools.md](references/pi-tools.md), and [antigravity-tools.md](references/antigravity-tools.md). Gemini CLI users get the tool mapping loaded automatically via GEMINI.md.
+
+# Using Skills
+
+## The Rule
+
+**Invoke relevant or requested skills BEFORE any response or action.** Even a 1% chance a skill might apply means that you should invoke the skill to check. If an invoked skill turns out to be wrong for the situation, you don't need to use it.
+
+```dot
+digraph skill_flow {
+    "User message received" [shape=doublecircle];
+    "About to enter plan mode?" [shape=doublecircle];
+    "Already brainstormed?" [shape=diamond];
+    "Invoke brainstorming skill" [shape=box];
+    "Might any skill apply?" [shape=diamond];
+    "Invoke the skill" [shape=box];
+    "Announce: 'Using [skill] to [purpose]'" [shape=box];
+    "Has checklist?" [shape=diamond];
+    "Create a todo per item" [shape=box];
+    "Follow skill exactly" [shape=box];
+    "Respond (including clarifications)" [shape=doublecircle];
+
+    "About to enter plan mode?" -> "Already brainstormed?";
+    "Already brainstormed?" -> "Invoke brainstorming skill" [label="no"];
+    "Already brainstormed?" -> "Might any skill apply?" [label="yes"];
+    "Invoke brainstorming skill" -> "Might any skill apply?";
+
+    "User message received" -> "Might any skill apply?";
+    "Might any skill apply?" -> "Invoke the skill" [label="yes, even 1%"];
+    "Might any skill apply?" -> "Respond (including clarifications)" [label="definitely not"];
+    "Invoke the skill" -> "Announce: 'Using [skill] to [purpose]'";
+    "Announce: 'Using [skill] to [purpose]'" -> "Has checklist?";
+    "Has checklist?" -> "Create a todo per item" [label="yes"];
+    "Has checklist?" -> "Follow skill exactly" [label="no"];
+    "Create a todo per item" -> "Follow skill exactly";
+}
+```
+
+## Red Flags
+
+These thoughts mean STOP—you're rationalizing:
+
+| Thought | Reality |
+|---------|---------|
+| "This is just a simple question" | Questions are tasks. Check for skills. |
+| "I need more context first" | Skill check comes BEFORE clarifying questions. |
+| "Let me explore the codebase first" | Skills tell you HOW to explore. Check first. |
+| "I can check git/files quickly" | Files lack conversation context. Check for skills. |
+| "Let me gather information first" | Skills tell you HOW to gather information. |
+| "This doesn't need a formal skill" | If a skill exists, use it. |
+| "I remember this skill" | Skills evolve. Read current version. |
+| "This doesn't count as a task" | Action = task. Check for skills. |
+| "The skill is overkill" | Simple things become complex. Use it. |
+| "I'll just do this one thing first" | Check BEFORE doing anything. |
+| "This feels productive" | Undisciplined action wastes time. Skills prevent this. |
+| "I know what that means" | Knowing the concept ≠ using the skill. Invoke it. |
+
+## Skill Priority
+
+When multiple skills could apply, use this order:
+
+1. **Process skills first** (brainstorming, systematic-debugging) - these determine HOW to approach the task
+2. **Implementation skills second** (frontend-design, mcp-builder) - these guide execution
+
+"Let's build X" → brainstorming first, then implementation skills.
+"Fix this bug" → systematic-debugging first, then domain-specific skills.
+
+## Skill Types
+
+**Rigid** (TDD, systematic-debugging): Follow exactly. Don't adapt away discipline.
+
+**Flexible** (patterns): Adapt principles to context.
+
+The skill itself tells you which.
+
+## User Instructions
+
+Instructions say WHAT, not HOW. "Add X" or "Fix Y" doesn't mean skip workflows.
+
+codex
+I’m gathering only native context first per the repo instructions: the local AGENTS.md, the file-specific diff, and status for the target file.
+exec
+/usr/bin/bash -lc "sed -n '1,260p' AGENTS.md" in /home/vi/animaschedext
+ succeeded in 0ms:
+# Repository Guidelines
+
+## Project Structure
+- Root docs: README.md, DEVELOPER_GUIDE.md, INSTALL.md, OVERVIEW.md
+- Scheduler: scheds/rust/scx_lavd/src/ (userspace) and scheds/rust/scx_lavd/src/bpf/ (BPF scheduler)
+- Hyprland daemon: scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+- Systemd/services: services/
+- Shared Rust workspace: rust/ and lib/
+
+## Build / Format / Docs
+- cargo build --release
+- cargo fmt
+- cargo fmt -- --check
+
+## Coding Conventions
+- Format with cargo fmt before committing
+- Rust: snake_case for identifiers, PasicalCase for types
+- Keep BPF patches minimal and local to scheduler logic
+- When editing, match the existing code style in the file
+
+## Verification
+- For scheduler-related changes, describe how you validated behavior
+- For BPF changes, consider verifier and runtime impact
+- Run relevant workspace checks before opening a PR
+
+## Commits & PRs
+- Use concise, present-tense commit messages explaining behavior change
+- Keep commits focused on one concern
+- PRs should summarize the change, rationale, affected paths, and how it was tested
+
+## SOP: MCP Tool Routing for Codebase Exploration
+
+> Always route through the native Droid equivalents listed in the Deferred toolbox
+> before falling back to their corresponding MCP hooks. `Indexing first, searching,
+> then reading full files only as needed` keeps exploration cheap.
+
+### 1. Torrent of the whole tree
+
+*Prefer* `LS` over `jcodemunch list_watchers` for one-shot directory listing.
+*MCP hook* `jcodemunch list_content` shines when you have already
+indexed a repo and need to search across **both** code and docs (TOML, Markdown,
+Dockerfile) simultaneously — for example, pinpointing where a scheduling
+constant is documented in `OVERVIEW.md` and referenced in `src/bpf/` at the same
+time.
+
+### 2. Exact symbol search
+
+*Try* `Grep` first with type filter `type=rust` or `case_insensitive=true`
+and `context`/`line_numbers` on.
+*MCP hook* `jcodemunch search_units` beats `Grep` when symbols cross
+file boundaries or when you expect to also surface documentation sections and
+doc comments — searching `LAT_CRI` across code + adjacent Markdowns is a typical
+case.
+
+### 3. Outline / signature drill-down
+
+*Use* `Glob` and `Read` with a hand-picked line range.
+*MCP hook* `jcodemunch get_outline` + `get_unit_context` returns
+token-budgeted symbol capsules — better than big-file `Read` when you need a
+summary of every struct or inline function in `main.bpf.c` without reading
+the whole object.
+
+### 4. Symbol-level context (callers / callees / references)
+
+*Start* with `Grep` and cursor the surrounding block with `context`.
+*MCP hooks* `jcodemunch find_references` / `get_blast_radius` /
+`get_call_hierarchy` win when the symbol appears in ten or more files
+(danger zone for missing places to patch during a refactor). For example,
+tracing which call sites actually depend on the BPF map update in
+`anima.bpf.c` is easier via blast radius than multiple greps across crates.
+
+### 5. Dead code and refactoring
+
+*No native equivalents.* Use these MCP hooks directly:
+`jcodemunch get_dead_code_v2` + `find_similar_symbols` to spot duplicate
+LAVD helper code that could be hoisted into `lib/`; `check_safe` before
+renaming lat-calc constants; `plan_refactoring` to produce concrete
+edit blocks you can feed into the file patches.
+
+### 6. Structural anti-pattern scan
+
+*No native equivalents.* `jcodemunch find_implementations` for locating
+polyfilles of ticket-function interfaces, `search_ast` for language-agnostic
+scans (empty catch blocks, deeply nested loops) across `.bpf.c` Rust and
+BPF C alike when global static-code violations need hunting down.
+
+### 7. Runtime diagnostics and profiling
+
+*No native equivalents.* Use `jcodemunch import_runtime_signal` /
+`find_hot_paths` when tuning BPF scheduler overhead on real workloads;
+`get_symbol_complexity` / `get_repo_health` as a quick triage before a larger
+rewrite.
+
+### Rules of thumb
+
+1. **Always start with `LS / Grep / Read`.** Spin up `jcodemunch` only when
+   the question crosses file or language boundaries, needs a hierarchical
+   view, or is a "structural smell" / "refactor" query.
+2. **Never install `jcodemunch`just for a "deeper search" click** — first
+   exhaust native tooling.
+3. **Feed MCP context to patches.** Wrap `get_symbol_source` /
+   `find_references` output into every file edit so downstream reviewers see the
+   provenance chain.
+4. **Alias usage by intent.** Before each MCP hit, add one line:
+   _"why `_hook_` > native: <one-line reason>."_ This keeps your SOP honest
+   and explainable to new contributors.
+
+exec
+/usr/bin/bash -lc 'git diff -- scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs' in /home/vi/animaschedext
+ succeeded in 0ms:
+diff --git a/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs b/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+index 92b278c..3f321eb 100644
+--- a/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
++++ b/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+@@ -18,10 +18,11 @@
+ //! - Signal handlers so the pinned map is wiped on exit/crash/SIGTERM
+ 
+ use std::collections::{HashMap, HashSet};
+-use std::io::{BufRead, BufReader, Read, Write};
++use std::io::{self, BufRead, BufReader, Read, Write};
+ use std::os::unix::net::{UnixListener, UnixStream};
+ use std::path::PathBuf;
+ use std::sync::{Arc, Mutex};
++use std::thread;
+ use std::time::{Duration, Instant};
+ 
+ use anyhow::{Context, Result};
+@@ -52,6 +53,16 @@ const DEFAULT_CHILD_MAX_CPU: f64 = 0.5;
+ /// that 1 Hz is plenty. Override with `ANIMA_SAMPLE_MILLIS`.
+ const DEFAULT_SAMPLE_MILLIS: u64 = 1000;
+ 
++/* ── audio-PID boost constants ─────────────────────────────────────── */
++
++/// PipeWire/PulseAudio stream audio-PID boost. Default `on`.
++const AUDIO_BOOST_DEFAULT: &str = "on";
++/// Polling interval in milliseconds for sink-input enumeration. Override
++/// with `ANIMA_AUDIO_POLL_MS`. Default 1000.
++const AUDIO_POLL_MS_DEFAULT: u64 = 1000;
++/// Audio command. Override with `ANIMA_AUDIO_CMD`. Default `pactl`.
++const AUDIO_CMD_DEFAULT: &str = "pactl";
++
+ /* ── data structures ───────────────────────────────────────────────── */
+ 
+ /// PIDs in the BPF map + CPU accounting state for child-filtering.
+@@ -60,6 +71,17 @@ struct Animamap {
+     config_handle: MapHandle,
+     last_keys: HashSet<u32>,
+     cpu: CpuFilter,
++    boost: BoostState,
++}
++
++/// Tracks the desired boost set as the union of focus/browser state and
++/// active audio streams. Keeping these inputs separate lets audio polling
++/// reconcile the map without waiting for the next focus event.
++#[derive(Default)]
++struct BoostState {
++    base_keys: HashSet<u32>,
++    audio_pids: HashSet<u32>,
++    active_keys: HashSet<u32>,
+ }
+ 
+ /// Tracks per-PID CPU samples so we can filter heavy children out of the
+@@ -79,6 +101,25 @@ struct Sample {
+     when: Instant,
+ }
+ 
++impl BoostState {
++    fn set_base_keys(&mut self, base_keys: HashSet<u32>) -> &HashSet<u32> {
++        self.base_keys = base_keys;
++        self.rebuild()
++    }
++
++    fn set_audio_pids(&mut self, audio_pids: HashSet<u32>) -> &HashSet<u32> {
++        self.audio_pids = audio_pids;
++        self.rebuild()
++    }
++
++    fn rebuild(&mut self) -> &HashSet<u32> {
++        self.active_keys.clear();
++        self.active_keys.extend(self.base_keys.iter().copied());
++        self.active_keys.extend(self.audio_pids.iter().copied());
++        &self.active_keys
++    }
++}
++
+ impl Animamap {
+     /// Open the pinned BPF maps. `MapHandle::from_pinned_path` is the
+     /// canonical entry point in libbpf-rs 0.26.x for opening a pinned
+@@ -87,10 +128,9 @@ impl Animamap {
+     /// fails hard with a clear error instead of silently dropping
+     /// updates.
+     fn open() -> Result<Self> {
+-        let handle = MapHandle::from_pinned_path(MAP_PIN_PATH)
+-            .with_context(|| format!(
+-                "cannot open pinned BPF map at {MAP_PIN_PATH} — is scx_lavd-anima running?"
+-            ))?;
++        let handle = MapHandle::from_pinned_path(MAP_PIN_PATH).with_context(|| {
++            format!("cannot open pinned BPF map at {MAP_PIN_PATH} — is scx_lavd-anima running?")
++        })?;
+         let config_handle = MapHandle::from_pinned_path(CONFIG_PIN_PATH)
+             .with_context(|| format!(
+                 "cannot open pinned BPF config map at {CONFIG_PIN_PATH} — is scx_lavd-anima running?"
+@@ -104,6 +144,7 @@ impl Animamap {
+                 DEFAULT_CHILD_MAX_CPU,
+                 Duration::from_millis(DEFAULT_SAMPLE_MILLIS),
+             ),
++            boost: BoostState::default(),
+         })
+     }
+ 
+@@ -124,66 +165,60 @@ impl Animamap {
+     /// back to `update_focused` when mode is inactive or no tab-PID has
+     /// been seen yet.
+     fn update_browser(&mut self, focused_pid: u32, tab_pid: u32) -> Result<()> {
+-        let mut new_keys = HashSet::with_capacity(2);
+-        new_keys.insert(focused_pid);
+-        new_keys.insert(tab_pid);
+-
+-        // Delete stale keys.
+-        for stale in self.last_keys.difference(&new_keys) {
+-            if let Err(e) = self.handle.delete(&stale.to_le_bytes()) {
+-                eprintln!("[anima] delete pid {stale}: {e}");
+-            }
+-        }
+-
+-        // Insert new keys.
+-        for &key in &new_keys {
+-            if let Err(e) = self
+-                .handle
+-                .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
+-            {
+-                return Err(anyhow::anyhow!("insert pid {key}: {e}"));
+-            }
+-        }
++        let mut base_keys = HashSet::with_capacity(2);
++        base_keys.insert(focused_pid);
++        base_keys.insert(tab_pid);
+ 
+-        self.last_keys = new_keys;
++        let new_keys = self.boost.set_base_keys(base_keys).clone();
++        self.apply_active_keys(&new_keys)?;
+         eprintln!("[anima] browser mode -> focused {focused_pid}, tab {tab_pid}");
+         Ok(())
+     }
+ 
+     /// Push the focused PID (and optionally its direct children) into
+     /// the map. Incremental: only deletes stale keys + inserts new keys.
+-    fn update_focused(
+-        &mut self,
+-        focused_pid: u32,
+-        include_children: bool,
+-    ) -> Result<()> {
+-        let mut new_keys: HashSet<u32> = HashSet::with_capacity(8);
+-        new_keys.insert(focused_pid);
++    /// Also unions the current set of audio-PIDs so that any process
++    /// driving a PulseAudio/PipeWire sink-input gets the boost even if
++    /// it is not focused (e.g. Spotify while you type in a terminal).
++    fn update_focused(&mut self, focused_pid: u32, include_children: bool) -> Result<()> {
++        let mut base_keys: HashSet<u32> = HashSet::with_capacity(8);
++        base_keys.insert(focused_pid);
+ 
+         if include_children {
+-            self.cpu.filter_children(focused_pid, &mut new_keys);
++            self.cpu.filter_children(focused_pid, &mut base_keys);
+         }
+ 
+-        // Delete stale keys.
+-        for stale in self.last_keys.difference(&new_keys) {
++        let n_children = base_keys.len().saturating_sub(1);
++        let new_keys = self.boost.set_base_keys(base_keys).clone();
++        self.apply_active_keys(&new_keys)?;
++        eprintln!("[anima] focused -> {focused_pid} ({n_children} children)");
++        Ok(())
++    }
++
++    /// Update audio-PIDs and reconcile the map immediately, without
++    /// waiting for a Hyprland focus event.
++    fn update_audio(&mut self, audio_pids: HashSet<u32>) -> Result<()> {
++        let new_keys = self.boost.set_audio_pids(audio_pids).clone();
++        self.apply_active_keys(&new_keys)
++    }
++
++    fn apply_active_keys(&mut self, new_keys: &HashSet<u32>) -> Result<()> {
++        for stale in self.last_keys.difference(new_keys) {
+             if let Err(e) = self.handle.delete(&stale.to_le_bytes()) {
+                 eprintln!("[anima] delete pid {stale}: {e}");
+             }
+         }
+ 
+-        // Insert new keys.
+-        for key in &new_keys {
+-            if let Err(e) = self
+-                .handle
+-                .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
++        for key in new_keys {
++            if let Err(e) =
++                self.handle
++                    .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
+             {
+                 return Err(anyhow::anyhow!("insert pid {key}: {e}"));
+             }
+         }
+ 
+-        let n = new_keys.len();
+-        self.last_keys = new_keys;
+-        eprintln!("[anima] focused -> {focused_pid} ({} children)", n - 1);
++        self.last_keys = new_keys.clone();
+         Ok(())
+     }
+ 
+@@ -259,8 +294,7 @@ impl CpuFilter {
+                     return 0.0;
+                 }
+                 let d = (cur.utime.saturating_sub(prev.utime)
+-                    + cur.stime.saturating_sub(prev.stime))
+-                    as f64;
++                    + cur.stime.saturating_sub(prev.stime)) as f64;
+                 let ticks_per_sec = 100.0; /* sysconf(_SC_CLK_TCK) on x86_64 */
+                 (d / ticks_per_sec) / dt
+             }
+@@ -337,6 +371,29 @@ fn read_comm(pid: u32) -> Option<String> {
+     Some(s.trim().to_string())
+ }
+ 
++/// Parse `pactl list sink-inputs` output and return the set of PIDs that
++/// currently own a sink-input (i.e. are actively playing audio via
++/// PulseAudio or PipeWire's pulse layer). Empty set when nothing is
++/// playing or when `pactl` is unavailable. Lines of interest look like:
++///     application.process.id = "12345"
++fn sample_audio(cmd: &str) -> io::Result<HashSet<u32>> {
++    let out = std::process::Command::new(cmd)
++        .args(["list", "sink-inputs"])
++        .output()?;
++    let s = String::from_utf8_lossy(&out.stdout);
++    let mut set = HashSet::new();
++    for line in s.lines() {
++        let line = line.trim();
++        if let Some(rest) = line.strip_prefix("application.process.id") {
++            let v = rest.trim().trim_start_matches('=').trim().trim_matches('"');
++            if let Ok(pid) = v.parse::<u32>() {
++                set.insert(pid);
++            }
++        }
++    }
++    Ok(set)
++}
++
+ /// Build an address → PID lookup table from `hyprctl clients -j`.
+ fn build_pid_cache() -> Result<HashMap<u64, u32>> {
+     let out = std::process::Command::new("hyprctl")
+@@ -394,11 +451,44 @@ fn hypr_sock2() -> Result<PathBuf> {
+     let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").map_err(|_| {
+         anyhow::anyhow!("HYPRLAND_INSTANCE_SIGNATURE not set — is Hyprland running?")
+     })?;
+-    let xdg = std::env::var("XDG_RUNTIME_DIR")
+-        .map_err(|_| anyhow::anyhow!("XDG_RUNTIME_DIR not set"))?;
++    let xdg =
++        std::env::var("XDG_RUNTIME_DIR").map_err(|_| anyhow::anyhow!("XDG_RUNTIME_DIR not set"))?;
+     Ok(PathBuf::from(format!("{xdg}/hypr/{sig}/.socket2.sock")))
+ }
+ 
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn pids(values: &[u32]) -> HashSet<u32> {
++        values.iter().copied().collect()
++    }
++
++    #[test]
++    fn audio_state_changes_rebuild_active_keys_without_focus_event() {
++        let mut state = BoostState::default();
++
++        let active = state.set_base_keys(pids(&[100])).clone();
++        assert_eq!(active, pids(&[100]));
++
++        let active = state.set_audio_pids(pids(&[200])).clone();
++        assert_eq!(active, pids(&[100, 200]));
++
++        let active = state.set_audio_pids(HashSet::new()).clone();
++        assert_eq!(active, pids(&[100]));
++    }
++
++    #[test]
++    fn browser_base_keys_include_audio_pids() {
++        let mut state = BoostState::default();
++
++        state.set_audio_pids(pids(&[300]));
++        let active = state.set_base_keys(pids(&[100, 200])).clone();
++
++        assert_eq!(active, pids(&[100, 200, 300]));
++    }
++}
++
+ /* ── main event loop ───────────────────────────────────────────────── */
+ 
+ fn main() -> Result<()> {
+@@ -465,6 +555,50 @@ fn main() -> Result<()> {
+         }
+     });
+ 
++    /* Audio-PID boost thread: poll `pactl list sink-inputs`, then
++     * reconcile the pinned map against current focus/browser keys plus
++     * active audio PIDs. Thread is skipped if ANIMA_AUDIO_BOOST=off. */
++    let anima_for_audio = Arc::clone(&anima);
++    let audio_raw =
++        std::env::var("ANIMA_AUDIO_BOOST").unwrap_or_else(|_| AUDIO_BOOST_DEFAULT.into());
++    let audio_enabled = !audio_raw.eq_ignore_ascii_case("off");
++    let audio_poll_ms: u64 = std::env::var("ANIMA_AUDIO_POLL_MS")
++        .ok()
++        .and_then(|s| s.parse::<u64>().ok())
++        .unwrap_or(AUDIO_POLL_MS_DEFAULT);
++    let audio_cmd: String =
++        std::env::var("ANIMA_AUDIO_CMD").unwrap_or_else(|_| AUDIO_CMD_DEFAULT.into());
++    if audio_enabled {
++        eprintln!("[anima] audio: poll thread started (cmd={audio_cmd}, poll_ms={audio_poll_ms})");
++        thread::spawn(move || {
++            let mut consecutive_empty = 0u32;
++            loop {
++                thread::sleep(Duration::from_millis(audio_poll_ms));
++                match sample_audio(&audio_cmd) {
++                    Ok(set) => {
++                        let is_empty = set.is_empty();
++                        if is_empty {
++                            consecutive_empty += 1;
++                            if consecutive_empty == 5 {
++                                eprintln!("[anima] audio: no active streams");
++                            }
++                        } else {
++                            consecutive_empty = 0;
++                        }
++                        if let Ok(mut g) = anima_for_audio.lock() {
++                            if let Err(e) = g.update_audio(set) {
++                                eprintln!("[anima] update_audio: {e}");
++                            }
++                        }
++                    }
++                    Err(e) => eprintln!("[anima] audio: {e}"),
++                }
++            }
++        });
++    } else {
++        eprintln!("[anima] audio: poll thread disabled (ANIMA_AUDIO_BOOST={audio_raw})");
++    }
++
+     let mut pid_cache = build_pid_cache()
+         .inspect_err(|e| eprintln!("[anima] cache build failed: {e}"))
+         .unwrap_or_default();
+
+exec
+/usr/bin/bash -lc 'git status --short -- scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs' in /home/vi/animaschedext
+ succeeded in 0ms:
+ M scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs
+
+codex
+The diff introduces a separate `BoostState` and an audio polling thread, so I’m checking the exact call paths and current line numbers before making the review call.
+exec
+/usr/bin/bash -lc "nl -ba scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs | sed -n '60,210p'" in /home/vi/animaschedext
+ succeeded in 0ms:
+    60	/// Polling interval in milliseconds for sink-input enumeration. Override
+    61	/// with `ANIMA_AUDIO_POLL_MS`. Default 1000.
+    62	const AUDIO_POLL_MS_DEFAULT: u64 = 1000;
+    63	/// Audio command. Override with `ANIMA_AUDIO_CMD`. Default `pactl`.
+    64	const AUDIO_CMD_DEFAULT: &str = "pactl";
+    65	
+    66	/* ── data structures ───────────────────────────────────────────────── */
+    67	
+    68	/// PIDs in the BPF map + CPU accounting state for child-filtering.
+    69	struct Animamap {
+    70	    handle: MapHandle,
+    71	    config_handle: MapHandle,
+    72	    last_keys: HashSet<u32>,
+    73	    cpu: CpuFilter,
+    74	    boost: BoostState,
+    75	}
+    76	
+    77	/// Tracks the desired boost set as the union of focus/browser state and
+    78	/// active audio streams. Keeping these inputs separate lets audio polling
+    79	/// reconcile the map without waiting for the next focus event.
+    80	#[derive(Default)]
+    81	struct BoostState {
+    82	    base_keys: HashSet<u32>,
+    83	    audio_pids: HashSet<u32>,
+    84	    active_keys: HashSet<u32>,
+    85	}
+    86	
+    87	/// Tracks per-PID CPU samples so we can filter heavy children out of the
+    88	/// boost set in window+tree mode.
+    89	struct CpuFilter {
+    90	    cache: HashMap<u32, Sample>,
+    91	    max_cpu: f64,
+    92	    sample_every: Duration,
+    93	    next_sample: Instant,
+    94	}
+    95	
+    96	/// Two `/proc/<pid>/stat` snapshots used to calculate CPU fraction.
+    97	#[derive(Clone)]
+    98	struct Sample {
+    99	    utime: u64,
+   100	    stime: u64,
+   101	    when: Instant,
+   102	}
+   103	
+   104	impl BoostState {
+   105	    fn set_base_keys(&mut self, base_keys: HashSet<u32>) -> &HashSet<u32> {
+   106	        self.base_keys = base_keys;
+   107	        self.rebuild()
+   108	    }
+   109	
+   110	    fn set_audio_pids(&mut self, audio_pids: HashSet<u32>) -> &HashSet<u32> {
+   111	        self.audio_pids = audio_pids;
+   112	        self.rebuild()
+   113	    }
+   114	
+   115	    fn rebuild(&mut self) -> &HashSet<u32> {
+   116	        self.active_keys.clear();
+   117	        self.active_keys.extend(self.base_keys.iter().copied());
+   118	        self.active_keys.extend(self.audio_pids.iter().copied());
+   119	        &self.active_keys
+   120	    }
+   121	}
+   122	
+   123	impl Animamap {
+   124	    /// Open the pinned BPF maps. `MapHandle::from_pinned_path` is the
+   125	    /// canonical entry point in libbpf-rs 0.26.x for opening a pinned
+   126	    /// BPF map by bpffs path. Requires `scx_lavd-anima` to be running
+   127	    /// first (it does the pinning) — if the pin is missing this call
+   128	    /// fails hard with a clear error instead of silently dropping
+   129	    /// updates.
+   130	    fn open() -> Result<Self> {
+   131	        let handle = MapHandle::from_pinned_path(MAP_PIN_PATH).with_context(|| {
+   132	            format!("cannot open pinned BPF map at {MAP_PIN_PATH} — is scx_lavd-anima running?")
+   133	        })?;
+   134	        let config_handle = MapHandle::from_pinned_path(CONFIG_PIN_PATH)
+   135	            .with_context(|| format!(
+   136	                "cannot open pinned BPF config map at {CONFIG_PIN_PATH} — is scx_lavd-anima running?"
+   137	            ))?;
+   138	
+   139	        Ok(Self {
+   140	            handle,
+   141	            config_handle,
+   142	            last_keys: HashSet::with_capacity(16),
+   143	            cpu: CpuFilter::new(
+   144	                DEFAULT_CHILD_MAX_CPU,
+   145	                Duration::from_millis(DEFAULT_SAMPLE_MILLIS),
+   146	            ),
+   147	            boost: BoostState::default(),
+   148	        })
+   149	    }
+   150	
+   151	    /// Write the boost level into the BPF config map once at startup.
+   152	    /// Clamped to `[0, MAX_BOOST]`. A failed write is non-fatal — the
+   153	    /// BPF default still applies.
+   154	    fn set_boost(&self, boost: u32) -> Result<()> {
+   155	        let clamped = std::cmp::min(boost, MAX_BOOST);
+   156	        self.config_handle
+   157	            .update(&0u32.to_le_bytes(), &clamped.to_le_bytes(), MapFlags::ANY)
+   158	            .with_context(|| format!("failed to update anima_config[{clamped}]"))?;
+   159	        Ok(())
+   160	    }
+   161	
+   162	    /// Browser-mode update: boost only the focused PID and the PID of the
+   163	    /// active browser tab reported by the WebExtension. Skips the
+   164	    /// children-of-focused-pid walk entirely (useless for browsers). Falls
+   165	    /// back to `update_focused` when mode is inactive or no tab-PID has
+   166	    /// been seen yet.
+   167	    fn update_browser(&mut self, focused_pid: u32, tab_pid: u32) -> Result<()> {
+   168	        let mut base_keys = HashSet::with_capacity(2);
+   169	        base_keys.insert(focused_pid);
+   170	        base_keys.insert(tab_pid);
+   171	
+   172	        let new_keys = self.boost.set_base_keys(base_keys).clone();
+   173	        self.apply_active_keys(&new_keys)?;
+   174	        eprintln!("[anima] browser mode -> focused {focused_pid}, tab {tab_pid}");
+   175	        Ok(())
+   176	    }
+   177	
+   178	    /// Push the focused PID (and optionally its direct children) into
+   179	    /// the map. Incremental: only deletes stale keys + inserts new keys.
+   180	    /// Also unions the current set of audio-PIDs so that any process
+   181	    /// driving a PulseAudio/PipeWire sink-input gets the boost even if
+   182	    /// it is not focused (e.g. Spotify while you type in a terminal).
+   183	    fn update_focused(&mut self, focused_pid: u32, include_children: bool) -> Result<()> {
+   184	        let mut base_keys: HashSet<u32> = HashSet::with_capacity(8);
+   185	        base_keys.insert(focused_pid);
+   186	
+   187	        if include_children {
+   188	            self.cpu.filter_children(focused_pid, &mut base_keys);
+   189	        }
+   190	
+   191	        let n_children = base_keys.len().saturating_sub(1);
+   192	        let new_keys = self.boost.set_base_keys(base_keys).clone();
+   193	        self.apply_active_keys(&new_keys)?;
+   194	        eprintln!("[anima] focused -> {focused_pid} ({n_children} children)");
+   195	        Ok(())
+   196	    }
+   197	
+   198	    /// Update audio-PIDs and reconcile the map immediately, without
+   199	    /// waiting for a Hyprland focus event.
+   200	    fn update_audio(&mut self, audio_pids: HashSet<u32>) -> Result<()> {
+   201	        let new_keys = self.boost.set_audio_pids(audio_pids).clone();
+   202	        self.apply_active_keys(&new_keys)
+   203	    }
+   204	
+   205	    fn apply_active_keys(&mut self, new_keys: &HashSet<u32>) -> Result<()> {
+   206	        for stale in self.last_keys.difference(new_keys) {
+   207	            if let Err(e) = self.handle.delete(&stale.to_le_bytes()) {
+   208	                eprintln!("[anima] delete pid {stale}: {e}");
+   209	            }
+   210	        }
+
+exec
+/usr/bin/bash -lc "nl -ba scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs | sed -n '360,480p'" in /home/vi/animaschedext
+ succeeded in 0ms:
+   360	        if ppid == parent {
+   361	            out.push(pid);
+   362	        }
+   363	    }
+   364	    Ok(out)
+   365	}
+   366	
+   367	/// Read the comm (command name) for a PID. Returns `None` if the
+   368	/// process has already exited or `/proc/<pid>/comm` is unreadable.
+   369	fn read_comm(pid: u32) -> Option<String> {
+   370	    let s = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+   371	    Some(s.trim().to_string())
+   372	}
+   373	
+   374	/// Parse `pactl list sink-inputs` output and return the set of PIDs that
+   375	/// currently own a sink-input (i.e. are actively playing audio via
+   376	/// PulseAudio or PipeWire's pulse layer). Empty set when nothing is
+   377	/// playing or when `pactl` is unavailable. Lines of interest look like:
+   378	///     application.process.id = "12345"
+   379	fn sample_audio(cmd: &str) -> io::Result<HashSet<u32>> {
+   380	    let out = std::process::Command::new(cmd)
+   381	        .args(["list", "sink-inputs"])
+   382	        .output()?;
+   383	    let s = String::from_utf8_lossy(&out.stdout);
+   384	    let mut set = HashSet::new();
+   385	    for line in s.lines() {
+   386	        let line = line.trim();
+   387	        if let Some(rest) = line.strip_prefix("application.process.id") {
+   388	            let v = rest.trim().trim_start_matches('=').trim().trim_matches('"');
+   389	            if let Ok(pid) = v.parse::<u32>() {
+   390	                set.insert(pid);
+   391	            }
+   392	        }
+   393	    }
+   394	    Ok(set)
+   395	}
+   396	
+   397	/// Build an address → PID lookup table from `hyprctl clients -j`.
+   398	fn build_pid_cache() -> Result<HashMap<u64, u32>> {
+   399	    let out = std::process::Command::new("hyprctl")
+   400	        .args(["clients", "-j"])
+   401	        .output()
+   402	        .with_context(|| "failed to spawn hyprctl clients")?;
+   403	    if !out.status.success() {
+   404	        return Ok(HashMap::new());
+   405	    }
+   406	    let entries: Vec<serde_json::Value> =
+   407	        serde_json::from_slice(&out.stdout).with_context(|| "parse hyprctl clients")?;
+   408	    let mut cache = HashMap::with_capacity(entries.len());
+   409	    for e in entries {
+   410	        let addr = e["address"]
+   411	            .as_str()
+   412	            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+   413	        let pid = e["pid"].as_u64().map(|p| p as u32);
+   414	        if let (Some(addr), Some(pid)) = (addr, pid) {
+   415	            if pid >= 1 {
+   416	                cache.insert(addr, pid);
+   417	            }
+   418	        }
+   419	    }
+   420	    Ok(cache)
+   421	}
+   422	
+   423	/// Hyprland event address → PID. Cache hit preferred; falls back to
+   424	/// `hyprctl activewindow -j` on miss and inserts into cache. Returns
+   425	/// None on error or if PID is 0 (kernel scheduler).
+   426	fn lookup_pid(addr: u64, cache: &mut HashMap<u64, u32>) -> Option<u32> {
+   427	    if let Some(p) = cache.get(&addr).copied() {
+   428	        return Some(p);
+   429	    }
+   430	    let Ok(out) = std::process::Command::new("hyprctl")
+   431	        .args(["activewindow", "-j"])
+   432	        .output()
+   433	    else {
+   434	        return None;
+   435	    };
+   436	    if !out.status.success() {
+   437	        return None;
+   438	    }
+   439	    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+   440	        return None;
+   441	    };
+   442	    let pid = json["pid"].as_u64().map(|p| p as u32)?;
+   443	    if pid == 0 {
+   444	        return None;
+   445	    }
+   446	    cache.insert(addr, pid);
+   447	    Some(pid)
+   448	}
+   449	
+   450	fn hypr_sock2() -> Result<PathBuf> {
+   451	    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").map_err(|_| {
+   452	        anyhow::anyhow!("HYPRLAND_INSTANCE_SIGNATURE not set — is Hyprland running?")
+   453	    })?;
+   454	    let xdg =
+   455	        std::env::var("XDG_RUNTIME_DIR").map_err(|_| anyhow::anyhow!("XDG_RUNTIME_DIR not set"))?;
+   456	    Ok(PathBuf::from(format!("{xdg}/hypr/{sig}/.socket2.sock")))
+   457	}
+   458	
+   459	#[cfg(test)]
+   460	mod tests {
+   461	    use super::*;
+   462	
+   463	    fn pids(values: &[u32]) -> HashSet<u32> {
+   464	        values.iter().copied().collect()
+   465	    }
+   466	
+   467	    #[test]
+   468	    fn audio_state_changes_rebuild_active_keys_without_focus_event() {
+   469	        let mut state = BoostState::default();
+   470	
+   471	        let active = state.set_base_keys(pids(&[100])).clone();
+   472	        assert_eq!(active, pids(&[100]));
+   473	
+   474	        let active = state.set_audio_pids(pids(&[200])).clone();
+   475	        assert_eq!(active, pids(&[100, 200]));
+   476	
+   477	        let active = state.set_audio_pids(HashSet::new()).clone();
+   478	        assert_eq!(active, pids(&[100]));
+   479	    }
+   480	
+
+exec
+/usr/bin/bash -lc "nl -ba scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs | sed -n '520,650p'" in /home/vi/animaschedext
+ succeeded in 0ms:
+   520	     * as 4 native-endian bytes each time the tab changes. */
+   521	    let browser_cmds: Vec<String> = std::env::var("ANIMA_BROWSER_CMDS")
+   522	        .unwrap_or_else(|_| "floorp,floorp-bin,librewolf,firefox,firefox-bin".into())
+   523	        .split(',')
+   524	        .map(|s| s.trim().to_string())
+   525	        .filter(|s| !s.is_empty())
+   526	        .collect();
+   527	    eprintln!("[anima] browser mode commands: {:?}", browser_cmds);
+   528	
+   529	    let active_tab_pid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+   530	    let active_tab_pid_for_thread = Arc::clone(&active_tab_pid);
+   531	    std::thread::spawn(move || {
+   532	        let sock_path = "/run/anima/tab.sock";
+   533	        let _ = std::fs::remove_file(sock_path); /* ignore NotFound */
+   534	        let Ok(listener) = UnixListener::bind(sock_path) else {
+   535	            eprintln!("[anima] tab-pid listener: cannot bind {sock_path}");
+   536	            return;
+   537	        };
+   538	        eprintln!("[anima] tab-pid listener bound on {sock_path}");
+   539	        for stream in listener.incoming() {
+   540	            let Ok(mut s) = stream else {
+   541	                break;
+   542	            };
+   543	            let mut buf = [0u8; 4];
+   544	            loop {
+   545	                match s.read_exact(&mut buf) {
+   546	                    Ok(()) => {
+   547	                        let pid = i32::from_ne_bytes(buf);
+   548	                        if pid > 0 {
+   549	                            *active_tab_pid_for_thread.lock().unwrap() = Some(pid as u32);
+   550	                        }
+   551	                    }
+   552	                    Err(_) => break, /* writer disconnected */
+   553	                }
+   554	            }
+   555	        }
+   556	    });
+   557	
+   558	    /* Audio-PID boost thread: poll `pactl list sink-inputs`, then
+   559	     * reconcile the pinned map against current focus/browser keys plus
+   560	     * active audio PIDs. Thread is skipped if ANIMA_AUDIO_BOOST=off. */
+   561	    let anima_for_audio = Arc::clone(&anima);
+   562	    let audio_raw =
+   563	        std::env::var("ANIMA_AUDIO_BOOST").unwrap_or_else(|_| AUDIO_BOOST_DEFAULT.into());
+   564	    let audio_enabled = !audio_raw.eq_ignore_ascii_case("off");
+   565	    let audio_poll_ms: u64 = std::env::var("ANIMA_AUDIO_POLL_MS")
+   566	        .ok()
+   567	        .and_then(|s| s.parse::<u64>().ok())
+   568	        .unwrap_or(AUDIO_POLL_MS_DEFAULT);
+   569	    let audio_cmd: String =
+   570	        std::env::var("ANIMA_AUDIO_CMD").unwrap_or_else(|_| AUDIO_CMD_DEFAULT.into());
+   571	    if audio_enabled {
+   572	        eprintln!("[anima] audio: poll thread started (cmd={audio_cmd}, poll_ms={audio_poll_ms})");
+   573	        thread::spawn(move || {
+   574	            let mut consecutive_empty = 0u32;
+   575	            loop {
+   576	                thread::sleep(Duration::from_millis(audio_poll_ms));
+   577	                match sample_audio(&audio_cmd) {
+   578	                    Ok(set) => {
+   579	                        let is_empty = set.is_empty();
+   580	                        if is_empty {
+   581	                            consecutive_empty += 1;
+   582	                            if consecutive_empty == 5 {
+   583	                                eprintln!("[anima] audio: no active streams");
+   584	                            }
+   585	                        } else {
+   586	                            consecutive_empty = 0;
+   587	                        }
+   588	                        if let Ok(mut g) = anima_for_audio.lock() {
+   589	                            if let Err(e) = g.update_audio(set) {
+   590	                                eprintln!("[anima] update_audio: {e}");
+   591	                            }
+   592	                        }
+   593	                    }
+   594	                    Err(e) => eprintln!("[anima] audio: {e}"),
+   595	                }
+   596	            }
+   597	        });
+   598	    } else {
+   599	        eprintln!("[anima] audio: poll thread disabled (ANIMA_AUDIO_BOOST={audio_raw})");
+   600	    }
+   601	
+   602	    let mut pid_cache = build_pid_cache()
+   603	        .inspect_err(|e| eprintln!("[anima] cache build failed: {e}"))
+   604	        .unwrap_or_default();
+   605	    eprintln!("[anima] PID cache: {} entries", pid_cache.len());
+   606	
+   607	    /* SIGINT/SIGTERM → wipe map then exit. */
+   608	    let anima_on_signal = Arc::clone(&anima);
+   609	    ctrlc::set_handler(move || {
+   610	        eprintln!("[anima] shutdown signal — clearing map");
+   611	        if let Ok(mut g) = anima_on_signal.lock() {
+   612	            let _ = g.clear();
+   613	        }
+   614	        std::process::exit(0);
+   615	    })
+   616	    .expect("install ctrl-c handler");
+   617	
+   618	    /* Subscribe on command channel, read events on event channel. */
+   619	    let cmd = ev_sock.with_file_name(".socket.sock");
+   620	    let mut sub = UnixStream::connect(&cmd).with_context(|| format!("connect {cmd:?}"))?;
+   621	    sub.write_all(b"/subscribeevent activewindowv2\n")?;
+   622	    sub.flush()?;
+   623	
+   624	    let reader = BufReader::new(UnixStream::connect(&ev_sock)?);
+   625	    for line in reader.lines() {
+   626	        let line = match line {
+   627	            Ok(l) => l,
+   628	            Err(_) => break,
+   629	        };
+   630	        if !line.starts_with("activewindowv2>>") {
+   631	            continue;
+   632	        }
+   633	        let addr_str = &line["activewindowv2>>".len()..];
+   634	        let Ok(addr) = u64::from_str_radix(addr_str.trim_start_matches("0x"), 16) else {
+   635	            continue;
+   636	        };
+   637	        let Some(pid) = lookup_pid(addr, &mut pid_cache) else {
+   638	            continue;
+   639	        };
+   640	
+   641	        /* Focus-mode detection: is the focused window a known browser, and
+   642	         * do we have an active-tab PID to switch to? */
+   643	        let tab_pid = *active_tab_pid.lock().unwrap();
+   644	        let is_browser = read_comm(pid)
+   645	            .map(|c| browser_cmds.contains(&c))
+   646	            .unwrap_or(false);
+   647	
+   648	        let mut g = anima.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+   649	        if is_browser && tab_pid.is_some() {
+   650	            let tp = tab_pid.unwrap();
+
+exec
+/usr/bin/bash -lc "nl -ba scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs | sed -n '205,240p;480,515p;641,665p'" in /home/vi/animaschedext
+ succeeded in 0ms:
+   205	    fn apply_active_keys(&mut self, new_keys: &HashSet<u32>) -> Result<()> {
+   206	        for stale in self.last_keys.difference(new_keys) {
+   207	            if let Err(e) = self.handle.delete(&stale.to_le_bytes()) {
+   208	                eprintln!("[anima] delete pid {stale}: {e}");
+   209	            }
+   210	        }
+   211	
+   212	        for key in new_keys {
+   213	            if let Err(e) =
+   214	                self.handle
+   215	                    .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
+   216	            {
+   217	                return Err(anyhow::anyhow!("insert pid {key}: {e}"));
+   218	            }
+   219	        }
+   220	
+   221	        self.last_keys = new_keys.clone();
+   222	        Ok(())
+   223	    }
+   224	
+   225	    /// Clear every entry in the pinned map. Called on SIGINT/SIGTERM and
+   226	    /// on graceful exit so no stale PID keeps boosting.
+   227	    fn clear(&mut self) -> Result<()> {
+   228	        let keys: Vec<_> = self.handle.keys().collect();
+   229	        let n = keys.len();
+   230	        for key in &keys {
+   231	            if key.len() == 4 {
+   232	                if let Err(e) = self.handle.delete(key) {
+   233	                    eprintln!("[anima] clear delete: {e}");
+   234	                }
+   235	            }
+   236	        }
+   237	        self.last_keys.clear();
+   238	        eprintln!("[anima] cleared {n} stale entries");
+   239	        Ok(())
+   240	    }
+   480	
+   481	    #[test]
+   482	    fn browser_base_keys_include_audio_pids() {
+   483	        let mut state = BoostState::default();
+   484	
+   485	        state.set_audio_pids(pids(&[300]));
+   486	        let active = state.set_base_keys(pids(&[100, 200])).clone();
+   487	
+   488	        assert_eq!(active, pids(&[100, 200, 300]));
+   489	    }
+   490	}
+   491	
+   492	/* ── main event loop ───────────────────────────────────────────────── */
+   493	
+   494	fn main() -> Result<()> {
+   495	    let mode = std::env::args().nth(1).unwrap_or_default();
+   496	    let include_children = mode == "window+tree";
+   497	    let ev_sock = hypr_sock2().map_err(|e| anyhow::anyhow!("Anima error: {e}"))?;
+   498	
+   499	    let anima = Arc::new(Mutex::new(Animamap::open().with_context(|| {
+   500	        "Cannot open pinned map — is scx_lavd-anima running and pinning \
+   501	         /sys/fs/bpf/anima_active_pids?"
+   502	    })?));
+   503	
+   504	    /* Tunables from environment. */
+   505	    let boost = std::env::var("ANIMA_BOOST")
+   506	        .ok()
+   507	        .and_then(|s| s.parse::<u32>().ok())
+   508	        .unwrap_or(DEFAULT_BOOST);
+   509	    {
+   510	        let g = anima.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+   511	        match g.set_boost(boost) {
+   512	            Ok(()) => eprintln!("[anima] boost set to {}", boost.min(MAX_BOOST)),
+   513	            Err(e) => eprintln!("[anima] set_boost({boost}) failed: {e}"),
+   514	        }
+   515	    }
+   641	        /* Focus-mode detection: is the focused window a known browser, and
+   642	         * do we have an active-tab PID to switch to? */
+   643	        let tab_pid = *active_tab_pid.lock().unwrap();
+   644	        let is_browser = read_comm(pid)
+   645	            .map(|c| browser_cmds.contains(&c))
+   646	            .unwrap_or(false);
+   647	
+   648	        let mut g = anima.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+   649	        if is_browser && tab_pid.is_some() {
+   650	            let tp = tab_pid.unwrap();
+   651	            if let Err(e) = g.update_browser(pid, tp) {
+   652	                eprintln!("[anima] update_browser: {e}");
+   653	            }
+   654	        } else if let Err(e) = g.update_focused(pid, include_children) {
+   655	            eprintln!("[anima] update_focused: {e}");
+   656	        }
+   657	    }
+   658	
+   659	    /* Graceful exit — clear what we touched. */
+   660	    anima
+   661	        .lock()
+   662	        .map_err(|e| anyhow::anyhow!("lock: {e}"))?
+   663	        .clear()?;
+   664	    drop(sub);
+   665	    Ok(())
+
+codex
+No blocking findings for the two requested audio-boost items.
+
+The current diff does address both issues:
+
+- Audio polling updates the pinned map independently of focus events. The audio thread polls `sample_audio()` and calls `g.update_audio(set)` directly at [anima_hypr_daemon.rs:577](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:577) and [anima_hypr_daemon.rs:589](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:589). `update_audio()` rebuilds audio state and immediately calls `apply_active_keys()` at [anima_hypr_daemon.rs:200](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:200), which performs the actual pinned-map deletes/inserts at [anima_hypr_daemon.rs:205](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:205).
+
+- Browser-mode updates preserve active audio PIDs. `BoostState` tracks `base_keys` separately from `audio_pids` at [anima_hypr_daemon.rs:81](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:81), and `rebuild()` unions both sets at [anima_hypr_daemon.rs:115](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:115). `update_browser()` only replaces the base focus/tab set, then applies the rebuilt union at [anima_hypr_daemon.rs:167](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:167).
+
+Remaining risk/test gap: the added tests cover the `BoostState` union behavior at [anima_hypr_daemon.rs:467](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:467) and [anima_hypr_daemon.rs:482](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:482), but there is no mocked or integration test proving `update_audio()` actually reconciles `last_keys` into the pinned map. Also, if `pactl` fails to spawn after audio PIDs were previously recorded, the error path logs but does not clear stale audio PIDs until a later successful poll returns an empty set.
+tokens used
+35,149
+No blocking findings for the two requested audio-boost items.
+
+The current diff does address both issues:
+
+- Audio polling updates the pinned map independently of focus events. The audio thread polls `sample_audio()` and calls `g.update_audio(set)` directly at [anima_hypr_daemon.rs:577](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:577) and [anima_hypr_daemon.rs:589](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:589). `update_audio()` rebuilds audio state and immediately calls `apply_active_keys()` at [anima_hypr_daemon.rs:200](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:200), which performs the actual pinned-map deletes/inserts at [anima_hypr_daemon.rs:205](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:205).
+
+- Browser-mode updates preserve active audio PIDs. `BoostState` tracks `base_keys` separately from `audio_pids` at [anima_hypr_daemon.rs:81](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:81), and `rebuild()` unions both sets at [anima_hypr_daemon.rs:115](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:115). `update_browser()` only replaces the base focus/tab set, then applies the rebuilt union at [anima_hypr_daemon.rs:167](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:167).
+
+Remaining risk/test gap: the added tests cover the `BoostState` union behavior at [anima_hypr_daemon.rs:467](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:467) and [anima_hypr_daemon.rs:482](/home/vi/animaschedext/scheds/rust/scx_lavd/examples/anima_hypr_daemon.rs:482), but there is no mocked or integration test proving `update_audio()` actually reconciles `last_keys` into the pinned map. Also, if `pactl` fails to spawn after audio PIDs were previously recorded, the error path logs but does not clear stale audio PIDs until a later successful poll returns an empty set.
