@@ -11,298 +11,278 @@
 [![DeepSource](https://app.deepsource.com/gh/animaios/animalavd.svg/?label=active+issues&show_trend=true&token=hTeG3XzzElKjGvZdZ_zO7CaZ)](https://app.deepsource.com/gh/animaios/animalavd/)
 [![DeepSource](https://app.deepsource.com/gh/animaios/animalavd.svg/?label=resolved+issues&show_trend=true&token=hTeG3XzzElKjGvZdZ_zO7CaZ)](https://app.deepsource.com/gh/animaios/animalavd/)
 
-**AnimaLAVD** is a purpose-built fork of the
-[scx_lavd](https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_lavd)
-(**L**atency-criticality **A**ware **V**irtual **D**eadline) scheduler from the
-[sched_ext](https://github.com/sched-ext/scx) project, tuned for the desktop
-gamer and interactive power user.
-
-The core LAVD scheduler is already excellent at keeping the system responsive
-under load: it classifies tasks by communication behavior and gives the most
-urgent, latency-sensitive ones the tightest virtual deadlines. AnimaLAVD
-adds one piece it was missing — awareness of which window is *actually focused
-in your window manager*.
+**A `sched_ext` LAVD scheduler fork that adds compositor-aware scheduling to Linux desktops.**
 
 </div>
 
----
+Unlike traditional schedulers that only see CPU usage, AnimaLAVD understands what the user is actually interacting with:
 
-## How it works
+* 🖥️ **Focused Hyprland window gets immediate CPU priority**
+* 🎧 **Audio workloads stay latency-safe during heavy system load**
+* 🌐 **Optional browser integration boosts the active tab renderer**
+* ⚡ **Rust-powered userspace daemon updates scheduler state in real time**
+* 🧬 **eBPF-backed scheduler decisions without kernel patches**
 
-```mermaid
-graph TD
-    H["Hyprland compositor"] --> |event| D["hypr-daemon"]
-    D --> |bpf_syscall| M["pinned BPF map"]
-    M --> |lookup| S["scx_lavd-anima"]
-    S --> |priority| K["LAVD kernel"]
-```
-
-Two moving parts:
-
-- **`scx_lavd-anima`** — a patched `scx_lavd` binary that pins an
-  `anima_active_pids` BPF map at `/sys/fs/bpf/anima_active_pids`. Loaded in
-  place of the usual `scx_lavd` by `scx_loader`.
-- **`anima-hypr-daemon`** — a standalone binary that you run as a systemd
-  service alongside `scx_loader`. It watches Hyprland focus events and
-  writes the focused PID into the pinned map via direct `bpf()` syscalls
-  through `libbpf_rs`.
-
-On start, the daemon reads `hyprctl clients -j` once and caches
-`address → PID`. Each focus event is resolved from that cache (with a
-fallback `hyprctl activewindow -j` for windows opened after daemon start).
-
-The new PID list is then applied directly to the pinned BPF map via
-`libbpf_rs::MapHandle::update` / `delete` — no `bpftool` subprocess, no
-JSON parsing, no temp file. Updates are *incremental*: only stale keys are
-deleted and only new keys inserted, so each focus change costs O(delta)
-syscalls regardless of map size. On `SIGINT`/`SIGTERM` and on graceful
-exit the map gets cleared the same way so no stale boost survives a daemon
-stop.
-
-The kernel-side LAVD sees each PID in the map and sets `lat_cri` to the
-user-configurable boost level (default 896, LAVD's top LC bucket). The
-focused task therefore wins dispatch on the next round without collapsing
-the deadline numerator to zero. Boost level is read from the
-`anima_config` BPF map, written by the daemon at startup from the
-`ANIMA_BOOST` environment variable.
+The result: a desktop that stays responsive while gaming, compiling, streaming, or running heavy workloads.
 
 ---
 
-## Installation
+# Why AnimaLAVD?
 
-### Prerequisites
+Linux schedulers are excellent at optimizing fairness and throughput.
 
-- Linux kernel **6.12+** with `sched_ext` enabled.
-- [hypridle](https://github.com/hyprwm/hypridle) or any idle daemon that
-  stops the scheduler when the user goes idle (the stock `gnome-idle.target`
-  setup works fine).
-- Hyprland (obviously).
-- `bpftool` v7.1+.
-- `cargo` + `libbpf-dev` for building.
+But they do not know:
 
-### Build
+> "This is the window the user is looking at right now."
 
-```bash
-# main scheduler binary (replaces /usr/bin/scx_lavd)
-cargo build --release -p scx_lavd
-# userspace Hyprland focus daemon
-cargo build --release --example anima_hypr_daemon -p scx_lavd
-```
+A browser tab playing music, a game window, an IDE editor, or a terminal running a command all look like normal processes to the kernel.
 
-Install:
+AnimaLAVD bridges this gap.
 
-```bash
-# Replace the default scx_lavd with our build
-sudo install -Dm755 target/release/scx_lavd /usr/local/bin/scx_lavd-anima
-
-# Install the daemon binary
-sudo install -Dm755 target/release/examples/anima_hypr_daemon \
-                /usr/local/bin/anima-hypr-daemon
-
-# Install unit files
-sudo install -Dm644 services/anima-scx-loader.conf \
-                /etc/systemd/system/scx_loader.service.d/anima.conf
-sudo install -Dm644 services/anima-hypr.service \
-                /etc/systemd/system/
-sudo systemctl daemon-reload
-```
-
-The drop-in `anima-scx-loader.conf` overrides `scx_loader.service` to launch
-`scx_lavd-anima` instead of the stock `scx_lavd`. Combined with
-`services/anima-hypr.service`, the chain at boot is:
+It connects:
 
 ```
-systemd ──► scx_loader.service ──► scx_lavd-anima (pins BPF map)
-                                       │
-               anima-hypr.service ─────┘ (subscribes + updates)
+User intent
+    ↓
+Hyprland focus events
+    ↓
+Rust userspace controller
+    ↓
+eBPF sched_ext scheduler
+    ↓
+CPU scheduling decisions
 ```
 
-Enable everything:
+The scheduler can now prioritize **what matters to the user**, not just what consumes CPU.
 
-```bash
-sudo systemctl enable scx_loader.service
-sudo systemctl enable anima-hypr.service
-sudo systemctl start scx_loader.service anima-hypr.service
+---
+
+# Features
+
+## 🖱️ Focus-aware scheduling
+
+When you switch windows:
+
+```
+Firefox → Terminal → Game
 ```
 
-### Tuning the boost level
+AnimaLAVD instantly updates the active PID list.
 
-The focused-window boost level is runtime-configurable via the
-`ANIMA_BOOST` environment variable. Default is 896 (top 12.5% LC bucket).
-Valid range: 0 (disable boost) .. 1024 (=LAVD_SCALE). Values above ~900
-start collapsing `dl_delta` toward zero — tune with care.
+The focused application receives a latency boost through the LAVD criticality system.
 
-```bash
-# Optional: tune boost at runtime (default 896, max 1024)
-ANIMA_BOOST=768 sudo -E /usr/local/bin/anima-hypr-daemon window+tree
+No:
+
+* `nice`
+* `renice`
+* wrapper scripts
+* application-specific hacks
+
+The scheduler handles it directly.
+
+---
+
+## ⚡ Real-time Rust control daemon
+
+`anima-hypr-daemon`:
+
+* listens to Hyprland IPC events
+* tracks focused windows
+* resolves window → PID mappings
+* updates pinned BPF maps directly
+
+Implementation:
+
+* Rust
+* `libbpf-rs`
+* direct `bpf()` map updates
+* incremental updates only
+
+No:
+
+* `bpftool` subprocess calls
+* temporary files
+* polling loops
+* JSON parsing on every event
+
+---
+
+## 🎧 Latency protection for interactive workloads
+
+Future integrations can extend the same mechanism to:
+
+* PipeWire streams
+* JACK clients
+* game audio threads
+* video playback
+* VR workloads
+
+The goal:
+
+> Background workloads should never destroy interactive latency.
+
+---
+
+## 🌐 Browser active-tab boosting (optional)
+
+Browsers hide useful information from the scheduler.
+
+A browser extension can expose:
+
+```
+Active tab
+    ↓
+Renderer PID
+    ↓
+Anima daemon
+    ↓
+LAVD boost
 ```
 
-To make the change permanent, edit `services/anima-hypr.service` and add
-`Environment="ANIMA_BOOST=768"` to the `[Service]` section, then
-`systemctl daemon-reload && systemctl restart anima-hypr.service`.
+Example:
 
-### Filtering heavy children (window+tree mode)
+```
+100 browser tabs open
 
-By default, `window+tree` boosts the focused PID plus its direct
-children. Some of those children are background compute (a compiler
-spawned from a terminal, a video encoder, the compile farm inside an
-IDE) — exactly what LAVD is meant to de-prioritize.
-
-The daemon samples each child's `/proc/<pid>/stat` for one second, two
-samples apart, and drops any child whose CPU fraction during the
-sampling window exceeded `ANIMA_CHILD_MAX_CPU` (default 0.5 = half a
-core). Set it to 1.0 to disable filtering entirely.
-
-```bash
-# Only boost children using <30% of a core on average
-ANIMA_CHILD_MAX_CPU=0.3 sudo -E /usr/local/bin/anima-hypr-daemon window+tree
+Focused YouTube tab
+        ↓
+Only its renderer receives priority
 ```
 
-The same environment variable is respected via systemd `Environment=`.
+Background tabs remain normal.
 
-### Runtime
+---
 
-To switch between `scx_lavd` and `scx_lavd-anima` on a running system:
+# Architecture
 
-```bash
-# Patch in
-sudo systemctl stop scx_loader.service
-sudo cp target/release/scx_lavd /usr/local/bin/scx_lavd-anima
-sudo systemctl start scx_loader.service anima-hypr.service
-
-# Revert
-sudo systemctl stop scx_loader.service anima-hypr.service
-# restore stock scx_lavd path and restart scx_loader
 ```
-
-When `anima-hypr-daemon` is running, watch the focus updates:
-
-```bash
-$ journalctl -u anima-hypr.service -f
-[anima] focused -> 2356175 (with 0 children)
-[anima] focused -> 2356843 (with 0 children)
-```
-
-And verify the kernel saw the boost:
-
-```bash
-$ sudo bpftool map dump pinned /sys/fs/bpf/anima_active_pids
-key: 0x0023 f9 6f (value 0x01)   # whatever the focused PID is
+                 Hyprland
+                    |
+                    |
+              focus events
+                    |
+                    v
+        anima-hypr-daemon (Rust)
+                    |
+                    |
+        pinned BPF maps (/sys/fs/bpf)
+                    |
+                    v
+            scx_lavd-anima
+                    |
+                    v
+          Linux sched_ext subsystem
+                    |
+                    v
+                   CPU
 ```
 
 ---
 
-## Configuration
+# How the boost works
 
-Edit `services/anima-hypr.service`:
+LAVD already calculates latency criticality based on task behavior.
 
-- `ExecStart=/usr/local/bin/anima-hypr-daemon window` — boost only the focused window's PID. This is the right default because many GUI apps (terminals, IDEs, etc.) fork children that are background compute — exactly what LAVD is meant to de-prioritize.
-- `ExecStart=/usr/local/bin/anima-hypr-daemon window+tree` — also boost direct children of the focused PID. Useful when the focused window forks a renderer/helper process you want kept snappy, but be aware: this will also boost a compiler or encoder running inside. Direct children only, never a deep tree walk.
-
-The stock `scx_lavd` flags still apply to `scx_lavd-anima` — see the upstream
-scx_lavd help. The drop-in `anima-scx-loader.conf` currently sets
-`--performance`; adjust to `--balanced` or remove the flag to autopilot-mode
-match your taste.
-
----
-
-## How the LAVD scheduler itself works
-
-This section is kept brief — see the upstream
-[scx_lavd](https://github.com/sched-ext/scx/tree/main/scheds/rust/scx_lavd)
-documentation for the full story. The很短 version:
-
-- Every task gets a **latency criticality** score based on how frequently it
-  wakes other tasks and how short its runs are. A task that sits in the middle
-  of a chain like *game engine → render thread → compositor* gets a higher
-  score than a long-running background compile.
-- The scheduler also computes a **virtual deadline** — shorter deadline means
-  LAVD picks you sooner. LC score is the denominator of that deadline.
-- On `ops.enqueue`, LAVD calls `calc_lat_cri()`. Our patch adds:
-
-  ```c
-  if (is_anima_focused_pid((u32)p->pid)) {
-      u32 zero = 0;
-      u32 *boost = bpf_map_lookup_elem(&anima_config, &zero);
-      taskc->lat_cri = boost ? *boost : LAVD_ANIMA_LC_BOOST_DFL;
-  }
-  ```
-
-  This forces the focused task into LAVD's top LC bucket using the
-  runtime-configurable boost level. The daemon writes the boost value into
-  the `anima_config` BPF map at startup; if the lookup fails (e.g.,
-  scheduler booted before the daemon), the default `LAVD_ANIMA_LC_BOOST_DFL`
-  (= 896 = top 12.5% LC) applies. Setting the boost higher divides the
-  deadline down to sub-ns granularity (`dl_delta == 0`), which makes the
-  focused task's virtual deadline land at
-  `cur_logical_CLK - LAVD_DL_COMPETE_WINDOW` — indistinguishable from any
-  other starving task. That starves background work without adding useful
-  priority separation. 896 (= `LAVD_SCALE * 7 / 8` = LAVD's own
-  `LAVD_LC_LATENCY_SENSITIVE_THRESH`) is enough to guarantee dispatch win
-  on the next round without collapsing the deadline to zero.
-
-Caveat: preemption is cooperative. If the focused task is blocked, normal
-LAVD rules apply to everything else. The boost only affects runnable PIDs, and
-only the PID that Hyprland currently considers focused.
-
----
-
-## Repository structure
+AnimaLAVD adds one extra signal:
 
 ```
-animalavd/
-├── scheds/rust/scx_lavd/
-│   ├── src/
-│   │   ├── bpf/
-│   │   │   ├── anima.bpf.h      # pinned BPF map + is_anima_focused_pid
-│   │   │   ├── lat_cri.bpf.c    # patched LC calc (boost focused tasks)
-│   │   │   └── main.bpf.c       # pin map at /sys/fs/bpf/anima_active_pids
-│   │   └── main.rs              # scx_lavd entry, chmod pinned map
-│   └── examples/
-│       └── anima_hypr_daemon.rs  # standalone Hyprland focus daemon
-└── services/
-    ├── anima-hypr.service       # systemd unit for the daemon
-    └── anima-scx-loader.conf    # drop-in that swaps in scx_lavd-anima
+Is this PID currently user-focused?
 ```
 
-### Upstream support
+If yes:
 
-AnimaLAVD patches land in two forms:
+```
+lat_cri = configured focus boost
+```
 
-- The **BPF patch** (everything in `src/bpf/`): merged into sched_ext's
-  scx_lavd when the community agrees. Until then, this small fork keeps the
-  patches compiling against upstream releases.
-- The **focus daemon + systemd units** (everything else): ships in this repo,
-  not upstream. The daemon relies on Hyprland-specific IPC that upstream has
-  no interest in maintaining.
+The focused task enters LAVD's highest latency class.
 
-Both live in the same repo so they share a version number and get tested
-together.
+Default:
 
----
+```
+ANIMA_BOOST=896
+```
 
-## License
-
-GPL-2.0 only — same as the upstream scx project. See [LICENSE](LICENSE).
+This gives the active application scheduler preference without completely starving background workloads.
 
 ---
 
-## Credits
+# Design goals
 
-- [Changwoo Min](https://github.com/changuk-min) and the
-  [Igalia](https://igalia.com/) crew for the upstream `scx_lavd` scheduler.
-- [sched_ext](https://github.com/sched-ext/scx) maintainers for the BPF
-  scheduler framework.
-- The Hyprland project for its excellent IPC.
+## Preserve LAVD behavior
+
+AnimaLAVD does not replace LAVD's scheduling logic.
+
+It adds one additional signal:
+
+```
+User attention
+```
+
+Everything else remains upstream LAVD.
 
 ---
 
-## Status
+## Low overhead
 
-We track the upstream scx repository. Whenever scx releases a new LAVD
-feature, we rebase this fork on top and re-do the few-line `is_anima_focused_pid`
-patch. Bug fixes specific to the focus-daemon come from the AnimAIOS community.
+Focus changes are rare.
 
-If you find a bug in this patch (not in the core LAVD logic), please open
-*this repo's* issues — the upstream project does not maintain the
-Hyprland-specific parts.
+Each update:
+
+* modifies only changed PIDs
+* uses direct BPF map operations
+* avoids userspace/kernel round trips
+
+---
+
+## Safe degradation
+
+If:
+
+* Hyprland stops
+* daemon exits
+* map is unavailable
+
+The scheduler falls back to normal LAVD behavior.
+
+No permanent priority changes are applied.
+
+---
+
+# Roadmap
+
+* [x] Hyprland focus tracking
+* [x] Rust userspace daemon
+* [x] eBPF PID priority map
+* [x] Runtime boost tuning
+* [x] Window tree filtering
+* [ ] PipeWire latency integration
+* [ ] Browser extension PID bridge
+* [ ] Game launcher integration
+* [ ] Per-application profiles
+
+---
+
+# The bigger idea
+
+AnimaLAVD is an experiment in **human-aware scheduling**.
+
+Traditional schedulers optimize:
+
+```
+CPU utilization
+fairness
+throughput
+```
+
+AnimaLAVD adds:
+
+```
+human attention
+interaction latency
+desktop responsiveness
+```
+
+The computer should prioritize what the user is doing — not what happens to be consuming the most CPU.
+
+---
