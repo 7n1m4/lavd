@@ -1,11 +1,14 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 
+use scx_utils::anima_tab_sock;
+
 fn main() -> io::Result<()> {
-    let mut stream = match UnixStream::connect("/run/anima/tab.sock") {
+    let sock_path = anima_tab_sock();
+    let mut stream = match UnixStream::connect(&sock_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[anima-tab-host] cannot connect to /run/anima/tab.sock: {e}");
+            eprintln!("[anima-tab-host] cannot connect to {sock_path:?}: {e}");
             std::process::exit(1);
         }
     };

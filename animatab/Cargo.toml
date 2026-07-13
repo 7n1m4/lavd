@@ -1,0 +1,11 @@
+[package]
+name = "anima-tab-host"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "anima-tab-host"
+path = "anima-tab-host.rs"
+
+[dependencies]
+scx_utils = { path = "../rust/scx_utils" }

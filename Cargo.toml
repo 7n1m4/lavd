@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "animatab",
     "rust/scx_arena/scx_arena",
     "rust/scx_cargo",
     "rust/scx_stats",

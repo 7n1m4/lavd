@@ -26,6 +26,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+
+use scx_utils::anima_tab_sock;
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 
 const MAP_PIN_PATH: &str = "/sys/fs/bpf/anima_active_pids";
@@ -526,16 +528,23 @@ fn main() -> Result<()> {
         .collect();
     eprintln!("[anima] browser mode commands: {:?}", browser_cmds);
 
-    let active_tab_pid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let active_tab_pid: Arc<parking_lot::Mutex<Option<u32>>> =
+        Arc::new(parking_lot::Mutex::new(None));
     let active_tab_pid_for_thread = Arc::clone(&active_tab_pid);
     std::thread::spawn(move || {
-        let sock_path = "/run/anima/tab.sock";
-        let _ = std::fs::remove_file(sock_path); /* ignore NotFound */
-        let Ok(listener) = UnixListener::bind(sock_path) else {
-            eprintln!("[anima] tab-pid listener: cannot bind {sock_path}");
+        let sock_path = anima_tab_sock();
+        eprintln!("[anima] tab-pid listener using {sock_path:?}");
+        let dir = sock_path.parent().expect("sock path has parent");
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("[anima] tab-pid listener: cannot create {dir:?}: {e}");
+            return;
+        }
+        let _ = std::fs::remove_file(&sock_path); /* ignore NotFound */
+        let Ok(listener) = UnixListener::bind(&sock_path) else {
+            eprintln!("[anima] tab-pid listener: cannot bind {sock_path:?}");
             return;
         };
-        eprintln!("[anima] tab-pid listener bound on {sock_path}");
+        eprintln!("[anima] tab-pid listener bound on {sock_path:?}");
         for stream in listener.incoming() {
             let Ok(mut s) = stream else {
                 break;
@@ -544,7 +553,7 @@ fn main() -> Result<()> {
             while let Ok(()) = s.read_exact(&mut buf) {
                 let pid = i32::from_ne_bytes(buf);
                 if pid > 0 {
-                    *active_tab_pid_for_thread.lock().unwrap() = Some(pid as u32);
+                    *active_tab_pid_for_thread.lock() = Some(pid as u32);
                 }
             }
         }
@@ -635,7 +644,7 @@ fn main() -> Result<()> {
 
         /* Focus-mode detection: is the focused window a known browser, and
          * do we have an active-tab PID to switch to? */
-        let tab_pid = *active_tab_pid.lock().unwrap();
+        let tab_pid = *active_tab_pid.lock();
         let is_browser = read_comm(pid)
             .map(|c| browser_cmds.contains(&c))
             .unwrap_or(false);

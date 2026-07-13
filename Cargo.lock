@@ -21,6 +21,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "anima-tab-host"
+version = "0.1.0"
+dependencies = [
+ "scx_utils",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1469,6 +1476,7 @@ dependencies = [
  "libc",
  "nix",
  "ordered-float",
+ "parking_lot",
  "plain",
  "rlimit",
  "scx_arena",

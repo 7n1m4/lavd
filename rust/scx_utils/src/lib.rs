@@ -101,6 +101,9 @@ pub use misc::monitor_stats;
 pub use misc::normalize_load_metric;
 pub use misc::try_set_rlimit_infinity;
 
+pub mod anima_path;
+pub use anima_path::anima_tab_sock;
+
 mod netdev;
 pub use netdev::read_netdevs;
 pub use netdev::NetDev;
