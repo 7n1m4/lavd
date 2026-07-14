@@ -1,6 +1,7 @@
 <div align=center>
 
 <img width="1672" height="941" alt="animalavd-logo" src="https://github.com/user-attachments/assets/9d1c8455-62d7-4653-af3d-79877b1e04e2" />
+<br><br>
 
 [![ Hyprland](https://img.shields.io/badge/Hyprland-compatible-blueviolet)](https://hyprland.org)
 [![DeepSource](https://app.deepsource.com/gh/animaios/animalavd.svg/?label=code+coverage&show_trend=true&token=hTeG3XzzElKjGvZdZ_zO7CaZ)](https://app.deepsource.com/gh/animaios/animalavd/)
