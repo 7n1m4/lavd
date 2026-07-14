@@ -1,9 +1,6 @@
 <div align=center>
 
-# [Anima](https://github.com/animaios/anima)LAVD
-
-<img width="256" height="384" alt="AnimAIOS mascot" src="https://github.com/user-attachments/assets/6d6699ed-e61b-4e8a-8148-6d9ab4b36cef" />
-<br><br>
+<img width="1672" height="941" alt="animalavd-logo" src="https://github.com/user-attachments/assets/9d1c8455-62d7-4653-af3d-79877b1e04e2" />
 
 [![ Hyprland](https://img.shields.io/badge/Hyprland-compatible-blueviolet)](https://hyprland.org)
 [![DeepSource](https://app.deepsource.com/gh/animaios/animalavd.svg/?label=code+coverage&show_trend=true&token=hTeG3XzzElKjGvZdZ_zO7CaZ)](https://app.deepsource.com/gh/animaios/animalavd/)
@@ -284,5 +281,7 @@ desktop responsiveness
 ```
 
 The computer should prioritize what the user is doing — not what happens to be consuming the most CPU.
+
+<img width="256" height="384" alt="AnimAIOS mascot" src="https://github.com/user-attachments/assets/6d6699ed-e61b-4e8a-8148-6d9ab4b36cef" />
 
 ---
