@@ -107,13 +107,55 @@ No:
 
 ## 🎧 Latency protection for interactive workloads
 
-Future integrations can extend the same mechanism to:
+Audio is detected at the source. The daemon subscribes to PipeWire's
+registry and boosts whatever is playing:
 
-* PipeWire streams
-* JACK clients
-* game audio threads
-* video playback
-* VR workloads
+```
+PipeWire registry (global events)
+    ↓
+playback-stream events: start / stop
+    ↓
+PID resolved via the owning Client object
+    ↓
+anima_active_pids BPF map
+    ↓
+same LAVD boost as the focused window
+```
+
+```
+Firefox playing a YouTube tab (unfocused)
+        ↓
+its PID is in the map even while you type
+```
+
+Streams arrive as events rather than being polled, so focus and audio
+are tracked as **separate inputs** and a stream that starts or stops
+while you keep typing is picked up without a focus event. Audio and the
+focused window receive the *same* boost — there is no per-PID priority
+in the map. If you want to reweight them, the lever is `ANIMA_BOOST`,
+which applies to all boosted PIDs alike.
+
+A stream node does not carry its own PID: it only carries `client.id`,
+and the PID lives on the matching `PipeWire:Interface:Client` object as
+`pipewire.sec.pid`. Both object types are watched and joined, so either
+may be announced first — a stream seen before its client is resolved
+once that client arrives.
+
+The PipeWire protocol is used directly, so the whole audio path is
+event-driven rather than a periodic subprocess. A stream stopping is
+observed directly as a registry `global_remove` event instead of being
+inferred from a stall, and there is nothing left to go stale between
+polls. JACK, game audio threads and video playback are the same
+mechanism: if it plays through a playback stream, it is boosted. If
+PipeWire is unavailable the daemon logs it and skips audio boosting
+entirely — focus tracking is unaffected.
+
+Disable it with `ANIMA_AUDIO_BOOST=off`.
+
+Set `ANIMA_AUDIO_TRACE=1` to narrate the classifier on stderr — why
+each registry node was skipped and how each PID was resolved. Useful
+when audio boosting appears to do nothing, because a rejected node is
+otherwise indistinguishable from nothing playing.
 
 The goal:
 
@@ -254,7 +296,7 @@ No permanent priority changes are applied.
 * [x] eBPF PID priority map
 * [x] Runtime boost tuning
 * [x] Window tree filtering
-* [ ] PipeWire latency integration
+* [x] PipeWire latency integration
 * [ ] Browser extension PID bridge
 * [ ] Game launcher integration
 * [ ] Per-application profiles

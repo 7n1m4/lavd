@@ -26,6 +26,8 @@ libbpf-rs = "=0.26.2"
 libc = "0.2"
 ordered-float = "5"
 parking_lot = "0.12"
+pipewire = "0.9.2"
+pipewire-sys = "0.9.2"
 scx_stats = { path = "../../../rust/scx_stats", version = "1.1.1" }
 scx_stats_derive = { path = "../../../rust/scx_stats/scx_stats_derive", version = "1.1.1" }
 scx_utils = { path = "../../../rust/scx_utils", version = "1.1.1", features = ["autopower"] }

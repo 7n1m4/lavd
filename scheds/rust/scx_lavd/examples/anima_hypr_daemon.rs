@@ -18,17 +18,19 @@
 //! - Signal handlers so the pinned map is wiped on exit/crash/SIGTERM
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use scx_utils::anima_tab_sock;
+mod anima_audio;
+use anima_audio::AudioEvent;
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
+use scx_utils::anima_tab_sock;
 
 const MAP_PIN_PATH: &str = "/sys/fs/bpf/anima_active_pids";
 const CONFIG_PIN_PATH: &str = "/sys/fs/bpf/anima_config";
@@ -57,13 +59,9 @@ const DEFAULT_SAMPLE_MILLIS: u64 = 1000;
 
 /* ── audio-PID boost constants ─────────────────────────────────────── */
 
-/// PipeWire/PulseAudio stream audio-PID boost. Default `on`.
+/// PipeWire stream audio-PID boost. Default `on`. Set to `off` to stop
+/// subscribing to PipeWire entirely (no connection, no events).
 const AUDIO_BOOST_DEFAULT: &str = "on";
-/// Polling interval in milliseconds for sink-input enumeration. Override
-/// with `ANIMA_AUDIO_POLL_MS`. Default 1000.
-const AUDIO_POLL_MS_DEFAULT: u64 = 1000;
-/// Audio command. Override with `ANIMA_AUDIO_CMD`. Default `pactl`.
-const AUDIO_CMD_DEFAULT: &str = "pactl";
 
 /* ── data structures ───────────────────────────────────────────────── */
 
@@ -74,11 +72,15 @@ struct Animamap {
     last_keys: HashSet<u32>,
     cpu: CpuFilter,
     boost: BoostState,
+    /// Live PipeWire stream count per PID. A PID holds the boost while it
+    /// has at least one stream.
+    audio_refs: HashMap<u32, usize>,
 }
 
 /// Tracks the desired boost set as the union of focus/browser state and
-/// active audio streams. Keeping these inputs separate lets audio polling
-/// reconcile the map without waiting for the next focus event.
+/// active audio streams. Keeping these inputs separate lets an audio
+/// stream starting or stopping reconcile the map without waiting for the
+/// next focus event.
 #[derive(Default)]
 struct BoostState {
     base_keys: HashSet<u32>,
@@ -122,6 +124,59 @@ impl BoostState {
     }
 }
 
+/// One reconciliation step: which keys to delete, which to write.
+///
+/// Pure (no syscalls) so the incremental-update logic can be tested
+/// without root privileges or a loaded scheduler — the real bug class
+/// here is "a key that stops being boosted is never deleted".
+struct MapDiff {
+    /// Keys present in `last` but not in `next` — must be deleted.
+    delete: Vec<u32>,
+    /// Keys in `next` that are not already in `last` — written in
+    /// ascending order for determinism. Keys retained from `last` skip
+    /// the write: nothing else mutates this map, so the entry is still
+    /// there and rewriting it on every focus event is pure syscall
+    /// amplification.
+    write: Vec<u32>,
+}
+
+impl MapDiff {
+    fn between(last: &HashSet<u32>, next: &HashSet<u32>) -> Self {
+        Self {
+            delete: {
+                let mut v: Vec<u32> = last.difference(next).copied().collect();
+                v.sort_unstable();
+                v
+            },
+            write: {
+                let mut v: Vec<u32> = next.difference(last).copied().collect();
+                v.sort_unstable();
+                v
+            },
+        }
+    }
+}
+
+/// Fold one PipeWire stream event into the per-PID live-stream count.
+///
+/// Pure so the ref-counting can be tested without a PipeWire connection.
+fn adjust_refs(refs: &mut HashMap<u32, usize>, event: AudioEvent) {
+    match event {
+        AudioEvent::Started(pid) => {
+            refs.entry(pid).and_modify(|n| *n += 1).or_insert(1);
+        }
+        AudioEvent::Stopped(pid) => {
+            if let Some(n) = refs.get_mut(&pid) {
+                if *n > 1 {
+                    *n -= 1;
+                } else {
+                    refs.remove(&pid);
+                }
+            }
+        }
+    }
+}
+
 impl Animamap {
     /// Open the pinned BPF maps. `MapHandle::from_pinned_path` is the
     /// canonical entry point in libbpf-rs 0.26.x for opening a pinned
@@ -147,6 +202,7 @@ impl Animamap {
                 Duration::from_millis(DEFAULT_SAMPLE_MILLIS),
             ),
             boost: BoostState::default(),
+            audio_refs: HashMap::with_capacity(8),
         })
     }
 
@@ -197,6 +253,28 @@ impl Animamap {
         Ok(())
     }
 
+    /// Apply one PipeWire registry event: add or drop one audio-PID and
+    /// reconcile the map immediately, without waiting for a Hyprland focus
+    /// event.
+    ///
+    /// Events are reference-counted per PID because a process can own more
+    /// than one playback stream (a game with music and a voice client, a
+    /// browser with two tabs playing). The last stop must not drop the
+    /// boost while another stream from that PID is still alive.
+    fn audio_event(&mut self, event: AudioEvent) -> Result<()> {
+        if let AudioEvent::Stopped(pid) = event {
+            if !self.audio_refs.contains_key(&pid) {
+                // PipeWire can deliver a removal for a node whose
+                // properties we filtered out (e.g. a capture stream).
+                eprintln!("[anima] audio: stop for untracked pid {pid}");
+                return Ok(());
+            }
+        }
+        adjust_refs(&mut self.audio_refs, event);
+        let pids: HashSet<u32> = self.audio_refs.keys().copied().collect();
+        self.update_audio(pids)
+    }
+
     /// Update audio-PIDs and reconcile the map immediately, without
     /// waiting for a Hyprland focus event.
     fn update_audio(&mut self, audio_pids: HashSet<u32>) -> Result<()> {
@@ -205,13 +283,14 @@ impl Animamap {
     }
 
     fn apply_active_keys(&mut self, new_keys: &HashSet<u32>) -> Result<()> {
-        for stale in self.last_keys.difference(new_keys) {
+        let diff = MapDiff::between(&self.last_keys, new_keys);
+        for stale in &diff.delete {
             if let Err(e) = self.handle.delete(&stale.to_le_bytes()) {
                 eprintln!("[anima] delete pid {stale}: {e}");
             }
         }
 
-        for key in new_keys {
+        for key in &diff.write {
             if let Err(e) =
                 self.handle
                     .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
@@ -373,29 +452,6 @@ fn read_comm(pid: u32) -> Option<String> {
     Some(s.trim().to_string())
 }
 
-/// Parse `pactl list sink-inputs` output and return the set of PIDs that
-/// currently own a sink-input (i.e. are actively playing audio via
-/// PulseAudio or PipeWire's pulse layer). Empty set when nothing is
-/// playing or when `pactl` is unavailable. Lines of interest look like:
-///     application.process.id = "12345"
-fn sample_audio(cmd: &str) -> io::Result<HashSet<u32>> {
-    let out = std::process::Command::new(cmd)
-        .args(["list", "sink-inputs"])
-        .output()?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    let mut set = HashSet::new();
-    for line in s.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("application.process.id") {
-            let v = rest.trim().trim_start_matches('=').trim().trim_matches('"');
-            if let Ok(pid) = v.parse::<u32>() {
-                set.insert(pid);
-            }
-        }
-    }
-    Ok(set)
-}
-
 /// Build an address → PID lookup table from `hyprctl clients -j`.
 fn build_pid_cache() -> Result<HashMap<u64, u32>> {
     let out = std::process::Command::new("hyprctl")
@@ -489,6 +545,105 @@ mod tests {
 
         assert_eq!(active, pids(&[100, 200, 300]));
     }
+
+    /* ── reconciliation: the incremental map update ─────────────────── */
+
+    /// A PID that stops being boosted must be deleted, not just left in
+    /// the map. This is the failure that leaves a stale boost forever.
+    #[test]
+    fn reconciliation_deletes_keys_that_stop_being_boosted() {
+        let last = pids(&[100, 200]);
+        let next = pids(&[100, 300]);
+
+        let diff = MapDiff::between(&last, &next);
+
+        assert_eq!(diff.delete, vec![200]);
+        // 100 is already in the map, so only 300 is written.
+        assert_eq!(diff.write, vec![300]);
+    }
+
+    /// A pure repeat must not touch the map at all — the whole point of
+    /// the incremental design.
+    #[test]
+    fn reconciliation_is_a_noop_when_the_set_is_unchanged() {
+        let set = pids(&[100, 200]);
+
+        let diff = MapDiff::between(&set, &set);
+
+        assert!(diff.delete.is_empty());
+        assert!(diff.write.is_empty());
+    }
+
+    /// Audio PID boosting an unfocused process, then focus moving on:
+    /// both the focus and the audio key have to survive until each one
+    /// independently stops applying.
+    #[test]
+    fn audio_key_survives_a_focus_change_that_recants_it() {
+        let mut state = BoostState::default();
+
+        // Focus is 100, and 300 is playing audio.
+        let active = state.set_base_keys(pids(&[100])).clone();
+        assert_eq!(active, pids(&[100]));
+        let active = state.set_audio_pids(pids(&[300])).clone();
+        assert_eq!(active, pids(&[100, 300]));
+
+        // Focus moves away from 100 with nothing focused (0 = no window).
+        // The audio key must still be there.
+        let active = state.set_base_keys(HashSet::new()).clone();
+        assert_eq!(active, pids(&[300]));
+    }
+
+    /// Keys are 32-bit little-endian on the wire; make sure the sort
+    /// order is over the numeric value, not the byte order.
+    #[test]
+    fn reconciliation_writes_in_ascending_pid_order() {
+        let last = HashSet::new();
+        let next = pids(&[217300, 12, 3]);
+
+        let diff = MapDiff::between(&last, &next);
+
+        assert_eq!(diff.write, vec![3, 12, 217300]);
+    }
+
+    /* ── PipeWire event ref-counting ───────────────────────────────── */
+
+    /// A PID holding two streams (music + voice, two browser tabs) must
+    /// keep the boost until its last stream stops. This is why events are
+    /// reference-counted rather than treated as a live/delta flag.
+    #[test]
+    fn audio_events_are_refcounted_per_pid() {
+        let mut refs: HashMap<u32, usize> = HashMap::new();
+        let playing = |r: &HashMap<u32, usize>| r.keys().copied().collect::<HashSet<u32>>();
+
+        adjust_refs(&mut refs, AudioEvent::Started(100));
+        assert_eq!(playing(&refs), pids(&[100]));
+
+        adjust_refs(&mut refs, AudioEvent::Started(100));
+        assert_eq!(refs.get(&100), Some(&2));
+        assert_eq!(playing(&refs), pids(&[100]));
+
+        // One stream ends — the process is still playing the other.
+        adjust_refs(&mut refs, AudioEvent::Stopped(100));
+        assert_eq!(playing(&refs), pids(&[100]));
+
+        adjust_refs(&mut refs, AudioEvent::Stopped(100));
+        assert!(playing(&refs).is_empty());
+    }
+
+    /// A stop for a PID with no live stream is a no-op — it must not
+    /// underflow or drop anything. PipeWire can deliver removals for nodes
+    /// the registry reported but whose props we filtered out.
+    #[test]
+    fn stop_for_untracked_pid_does_not_underflow() {
+        let mut refs: HashMap<u32, usize> = HashMap::new();
+        adjust_refs(&mut refs, AudioEvent::Started(100));
+
+        adjust_refs(&mut refs, AudioEvent::Stopped(200)); /* never seen */
+        adjust_refs(&mut refs, AudioEvent::Stopped(200));
+
+        assert_eq!(refs.get(&100), Some(&1));
+        assert_eq!(refs.len(), 1);
+    }
 }
 
 /* ── main event loop ───────────────────────────────────────────────── */
@@ -559,48 +714,42 @@ fn main() -> Result<()> {
         }
     });
 
-    /* Audio-PID boost thread: poll `pactl list sink-inputs`, then
-     * reconcile the pinned map against current focus/browser keys plus
-     * active audio PIDs. Thread is skipped if ANIMA_AUDIO_BOOST=off. */
+    /* Audio-PID boost: native PipeWire registry subscription. Streams
+     * are reported as events, so nothing is polled and a stream stopping
+     * is observed directly rather than inferred from a stall. Set
+     * ANIMA_AUDIO_BOOST=off to skip subscribing entirely. */
     let anima_for_audio = Arc::clone(&anima);
     let audio_raw =
         std::env::var("ANIMA_AUDIO_BOOST").unwrap_or_else(|_| AUDIO_BOOST_DEFAULT.into());
     let audio_enabled = !audio_raw.eq_ignore_ascii_case("off");
-    let audio_poll_ms: u64 = std::env::var("ANIMA_AUDIO_POLL_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(AUDIO_POLL_MS_DEFAULT);
-    let audio_cmd: String =
-        std::env::var("ANIMA_AUDIO_CMD").unwrap_or_else(|_| AUDIO_CMD_DEFAULT.into());
     if audio_enabled {
-        eprintln!("[anima] audio: poll thread started (cmd={audio_cmd}, poll_ms={audio_poll_ms})");
+        let (tx, rx) = mpsc::channel::<AudioEvent>();
+        anima_audio::spawn_audio_watcher(tx);
         thread::spawn(move || {
-            let mut consecutive_empty = 0u32;
-            loop {
-                thread::sleep(Duration::from_millis(audio_poll_ms));
-                match sample_audio(&audio_cmd) {
-                    Ok(set) => {
-                        let is_empty = set.is_empty();
-                        if is_empty {
-                            consecutive_empty += 1;
-                            if consecutive_empty == 5 {
-                                eprintln!("[anima] audio: no active streams");
-                            }
-                        } else {
-                            consecutive_empty = 0;
-                        }
-                        if let Ok(mut g) = anima_for_audio.lock() {
-                            if let Err(e) = g.update_audio(set) {
-                                eprintln!("[anima] update_audio: {e}");
-                            }
-                        }
+            for event in rx {
+                match event {
+                    AudioEvent::Started(pid) => {
+                        eprintln!("[anima] pipewire: playing pid {pid}");
                     }
-                    Err(e) => eprintln!("[anima] audio: {e}"),
+                    AudioEvent::Stopped(pid) => {
+                        eprintln!("[anima] pipewire: stopped pid {pid}");
+                    }
+                }
+
+                let mut g = match anima_for_audio.lock() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        eprintln!("[anima] audio: lock: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = g.audio_event(event) {
+                    eprintln!("[anima] audio_event: {e}");
                 }
             }
         });
     } else {
-        eprintln!("[anima] audio: poll thread disabled (ANIMA_AUDIO_BOOST={audio_raw})");
+        eprintln!("[anima] audio: pipewire subscription disabled (ANIMA_AUDIO_BOOST={audio_raw})");
     }
 
     let mut pid_cache = build_pid_cache()
