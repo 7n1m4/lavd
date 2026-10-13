@@ -163,6 +163,51 @@ The goal:
 
 ---
 
+## 🧠 Swap protection for the focused window (optional)
+
+A focused window that the kernel has pushed to swap is the worst possible
+place for latency: every fault back in is a synchronous disk read, and the
+compositor, not the background build, pays for underrun.
+
+The daemon can move the process owning the focused window into a cgroup
+with `memory.swap.max = 0`, so what it allocates from that point on cannot
+be written out to swap.
+
+```bash
+ANIMA_SWAP_PROTECT=on anima-hypr-daemon window+tree
+```
+
+Off by default, because relocating a user process is heavier intervention
+than a scheduler boost. `ANIMA_SWAP_SLOTS` (default 3) sizes the pool of
+protected windows, and `ANIMA_SWAP_TRACE=1` narrates every migration.
+
+Three properties worth knowing before enabling it:
+
+- **Only future allocations are protected.** cgroup v2 does not move
+  memory charges on migration — the kernel documents this — so a
+  browser's already-allocated heap stays swappable. What is protected is
+  everything the window allocates going forward.
+- **No `memory.max` is ever written.** The goal is to stop swapping, not
+  to cap memory; a cap is an OOM kill, which for the compositor is worse
+  than swapping.
+- **CPU share is mirrored.** The source cgroup's `cpu.weight` is copied
+  into the slot, so protection cannot silently change CPU distribution.
+
+No `mlock(2)` is involved: it can only pin the caller's own address
+space, so it cannot protect another process, and `memory.swappiness` is
+root-only.
+
+Release returns the window to the cgroup it came from. If that cgroup
+refuses the write (root-owned GUI session scopes), a neutral `released/`
+leaf is used instead — the fallback, not the normal path, because
+processes left there would prevent the pool from being torn down.
+
+Every step is best-effort: a cgroup that cannot be written leaves the
+window swappable, which is the pre-existing behaviour, not a regression,
+and the boost path is never gated on swap protection.
+
+---
+
 ## 🌐 Browser active-tab boosting (optional)
 
 Browsers hide useful information from the scheduler.

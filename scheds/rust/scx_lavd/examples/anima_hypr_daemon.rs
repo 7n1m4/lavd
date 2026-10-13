@@ -29,6 +29,8 @@ use anyhow::{Context, Result};
 
 mod anima_audio;
 use anima_audio::AudioEvent;
+mod anima_swap;
+use anima_swap::SwapGuard;
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use scx_utils::anima_tab_sock;
 
@@ -62,6 +64,12 @@ const DEFAULT_SAMPLE_MILLIS: u64 = 1000;
 /// PipeWire stream audio-PID boost. Default `on`. Set to `off` to stop
 /// subscribing to PipeWire entirely (no connection, no events).
 const AUDIO_BOOST_DEFAULT: &str = "on";
+
+/* ── swap-protection constants ─────────────────────────────────────── */
+
+/// Label for the off state of `ANIMA_SWAP_PROTECT` in the startup line,
+/// so the printed default and the code agree.
+const SWAP_PROTECT_DEFAULT: &str = "off";
 
 /* ── data structures ───────────────────────────────────────────────── */
 
@@ -644,6 +652,31 @@ mod tests {
         assert_eq!(refs.get(&100), Some(&1));
         assert_eq!(refs.len(), 1);
     }
+
+    /* ── swap protection must not couple to the boost path ─────────── */
+
+    /// Swap protection is the only step in the focus-event path that is
+    /// allowed to fail, so it has to be independent of the boost path
+    /// rather than merely ordered after it. `SwapGuard` is disarmed by
+    /// default, so this asserts what production actually runs when
+    /// `ANIMA_SWAP_PROTECT` is unset.
+    #[test]
+    fn a_disarmed_swapguard_is_inert_and_keeps_no_state() {
+        let mut guard = SwapGuard::disarmed_for_test();
+
+        assert!(!guard.is_enabled());
+
+        // Any sequence of focus events, including a repeat and a PID the
+        // pool has never seen, must change nothing and never panic.
+        for pid in [0, 1, 100, 100, 100_000] {
+            guard.set_focus(pid);
+        }
+        guard.clear();
+        guard.teardown();
+
+        assert!(!guard.is_enabled());
+        assert!(guard.is_idle_for_test());
+    }
 }
 
 /* ── main event loop ───────────────────────────────────────────────── */
@@ -653,10 +686,52 @@ fn main() -> Result<()> {
     let include_children = mode == "window+tree";
     let ev_sock = hypr_sock2().map_err(|e| anyhow::anyhow!("Anima error: {e}"))?;
 
-    let anima = Arc::new(Mutex::new(Animamap::open().with_context(|| {
-        "Cannot open pinned map — is scx_lavd-anima running and pinning \
-         /sys/fs/bpf/anima_active_pids?"
-    })?));
+    /* Swap protection for the focused window: the process owning it is
+     * moved into a cgroup with `memory.swap.max = 0`, so what it
+     * allocates from now on cannot be pushed out to swap. Off unless
+     * ANIMA_SWAP_PROTECT=1/true/on, and every failure is contained — an
+     * unusable cgroup leaves the window swappable, which is the
+     * pre-existing behaviour, not a regression.
+     *
+     * Deliberately first, BEFORE the pinned BPF maps are opened: swap
+     * protection is a userspace cgroup concern and needs no scheduler or
+     * root, while the boost path needs both. Initialising the swapguard
+     * after the map open would mean a missing pin (scheduler not loaded)
+     * also silently skips swap protection, which makes the two features
+     * fail together for reasons that have nothing to do with each other.
+     * It must never gate the boost path either. */
+    let swapguard: Mutex<SwapGuard> = Mutex::new(SwapGuard::from_env());
+    let swapguard = Arc::new(swapguard);
+    let swapguard_on_signal = Arc::clone(&swapguard);
+    eprintln!(
+        "[anima] swapguard: {} (default {})",
+        if swapguard.lock().map(|g| g.is_enabled()).unwrap_or(false) {
+            "armed"
+        } else {
+            SWAP_PROTECT_DEFAULT
+        },
+        SWAP_PROTECT_DEFAULT
+    );
+
+    let anima = Arc::new(Mutex::new(match Animamap::open() {
+        Ok(a) => a,
+        Err(e) => {
+            /* The boost path needs root and a running scheduler; swap
+             * protection needs neither. Tearing the pool down here keeps a
+             * missing pin from leaking cgroups, which would otherwise sit
+             * in the user slice holding a `memory.swap.max=0` that nothing
+             * is using — and, worse, still holding whatever process was
+             * last moved into a slot. */
+            if let Ok(mut sg) = swapguard.lock() {
+                sg.clear();
+                sg.teardown();
+            }
+            return Err(e).with_context(|| {
+                "Cannot open pinned map — is scx_lavd-anima running and pinning \
+                 /sys/fs/bpf/anima_active_pids?"
+            });
+        }
+    }));
 
     /* Tunables from environment. */
     let boost = std::env::var("ANIMA_BOOST")
@@ -764,6 +839,12 @@ fn main() -> Result<()> {
         if let Ok(mut g) = anima_on_signal.lock() {
             let _ = g.clear();
         }
+        /* Release every protected process before exiting, or their slot
+         * headings stay behind in a tree this daemon no longer runs. */
+        if let Ok(mut g) = swapguard_on_signal.lock() {
+            g.clear();
+            g.teardown();
+        }
         std::process::exit(0);
     })
     .expect("install ctrl-c handler");
@@ -806,6 +887,18 @@ fn main() -> Result<()> {
         } else if let Err(e) = g.update_focused(pid, include_children) {
             eprintln!("[anima] update_focused: {e}");
         }
+        drop(g);
+
+        /* Swap protection last, and after the boost path has already run
+         * to completion: it is the only step here that can fail without
+         * costing anything, so it must never be able to interrupt the
+         * map update above. A poisoning guard is recovered from rather
+         * than propagated for the same reason — swap protection that
+         * took down the daemon would be strictly worse than none. */
+        match swapguard.lock() {
+            Ok(mut sg) => sg.set_focus(pid),
+            Err(e) => eprintln!("[anima] swapguard: lock: {e}"),
+        }
     }
 
     /* Graceful exit — clear what we touched. */
@@ -813,6 +906,10 @@ fn main() -> Result<()> {
         .lock()
         .map_err(|e| anyhow::anyhow!("lock: {e}"))?
         .clear()?;
+    if let Ok(mut sg) = swapguard.lock() {
+        sg.clear();
+        sg.teardown();
+    }
     drop(sub);
     Ok(())
 }
