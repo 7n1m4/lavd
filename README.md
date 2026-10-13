@@ -163,7 +163,7 @@ The goal:
 
 ---
 
-## 🧠 Swap protection for the focused window (optional)
+## 🧠 Swap protection for the focused window
 
 A focused window that the kernel has pushed to swap is the worst possible
 place for latency: every fault back in is a synchronous disk read, and the
@@ -174,14 +174,33 @@ with `memory.swap.max = 0`, so what it allocates from that point on cannot
 be written out to swap.
 
 ```bash
-ANIMA_SWAP_PROTECT=on anima-hypr-daemon window+tree
+anima-hypr-daemon window+tree
+# opt out explicitly:
+ANIMA_SWAP_PROTECT=off anima-hypr-daemon window+tree
 ```
 
-Off by default, because relocating a user process is heavier intervention
-than a scheduler boost. `ANIMA_SWAP_SLOTS` (default 3) sizes the pool of
-protected windows, and `ANIMA_SWAP_TRACE=1` narrates every migration.
+On by default, because the protection matters most in the run nobody
+configured — relocating a user process is a heavier intervention than a
+scheduler boost, so an *unrecognized* value also turns it off rather
+than being read as a yes. All four variables are read once at daemon
+start, never per focus event:
 
-Three properties worth knowing before enabling it:
+| Variable | Default | Meaning |
+|---|---|---|
+| `ANIMA_SWAP_PROTECT` | on | `0`/`false`/`off` turn it off |
+| `ANIMA_SWAP_SLOTS` | 3 | how many windows stay protected (1..=16) |
+| `ANIMA_SWAP_SETTLE` | 250 ms | how long focus must hold before migrating |
+| `ANIMA_SWAP_TRACE` | off | narrate every migration on stderr |
+
+A migration is not free — two `cgroup.procs` writes plus a `cpu.weight`
+mirror — so focus that flits between windows is debounced rather than
+followed. While focus is still moving, nothing is migrated at all and the
+window that already holds protection keeps its slot; the moment focus
+settles, the old window is released and the new one pinned, once. Set
+`ANIMA_SWAP_SETTLE=0` to migrate on the focus event itself, which is what
+cycling through windows cheaply costs you.
+
+Three properties worth knowing while it is on:
 
 - **Only future allocations are protected.** cgroup v2 does not move
   memory charges on migration — the kernel documents this — so a

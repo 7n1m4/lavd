@@ -64,14 +64,34 @@
 //! teardown leaks the pool. The leaf therefore stays empty in normal
 //! operation and the fallback is the exception.
 //!
-//! ## Off by default
+//! ## On by default
 //!
-//! `ANIMA_SWAP_PROTECT` is off unless set to `1`, `true` or `on`. The
+//! `ANIMA_SWAP_PROTECT` is on unless set to `0`, `false` or `off`. The
+//! protection matters most in the run nobody told about the variable, so
+//! the default has to be the state a user actually wants. An
+//! unrecognized value also turns it off, and says so on stderr: the
 //! feature relocates user processes between cgroups — a heavier
-//! intervention than a scheduler boost, so it opts in. `ANIMA_SWAP_SLOTS`
-//! (default 3, clamped to 1..=16) sizes the pool, and `ANIMA_SWAP_TRACE`
-//! narrates every decision on stderr. Both variables are read once at
-//! start, never per event.
+//! intervention than a scheduler boost — so a typo must never be read as
+//! consent to keep doing it, and a silent failure to arm is the one
+//! outcome a reader cannot diagnose after the fact. `ANIMA_SWAP_SLOTS`
+//! (default 3, clamped to 1..=16) sizes the pool, `ANIMA_SWAP_SETTLE`
+//! (default 250 ms) is how long focus must hold still before it is
+//! acted on, and `ANIMA_SWAP_TRACE` narrates every decision on stderr.
+//! All of them are read once at start, never per event.
+//!
+//! ## Focus is debounced, not followed
+//!
+//! A migration costs two `cgroup.procs` writes and a `cpu.weight` mirror,
+//! so acting on every focus event would mean unpinning and repinning a
+//! process as attention sweeps across the screen, which protects nothing
+//! and churns the tree. [`FocusSettle`] therefore holds a candidate until
+//! it has been the focus for the whole cooldown, counting from when it was
+//! *first* seen so a rapidly re-announced focus cannot keep itself
+//! permanently unsettled. Focus that never settles migrates nothing at
+//! all, and the window already protected keeps its slot rather than being
+//! released and re-protected. Once focus does settle, what happens is
+//! exactly what always happened: the previous focus is released, the new
+//! one is protected, once.
 //!
 //! Everything here is best-effort. A failure to create a cgroup, mirror a
 //! `cpu.weight` or move a process (EPERM, ESRCH, EBUSY, a missing
@@ -86,8 +106,8 @@ use anyhow::{Context, Result};
 
 /* ── tunable constants ─────────────────────────────────────────────── */
 
-/// Name of the environment variable arming swap protection. Off unless
-/// set to one of [`ENABLE_VALUES`].
+/// Name of the environment variable controlling swap protection. On by
+/// default; set to one of [`DISABLE_VALUES`] to turn it off.
 const ENV_SWAP_PROTECT: &str = "ANIMA_SWAP_PROTECT";
 
 /// Name of the environment variable sizing the slot pool.
@@ -99,6 +119,13 @@ const ENV_SWAP_TRACE: &str = "ANIMA_SWAP_TRACE";
 /// Values, other than unset, that count as arming the feature or enabling
 /// tracing. Case-insensitive.
 const ENABLE_VALUES: [&str; 3] = ["1", "true", "on"];
+
+/// Values that turn swap protection off. Case-insensitive.
+///
+/// Its own list rather than a negation of [`ENABLE_VALUES`], because the
+/// unset case means the opposite thing here: unset is *on* for
+/// [`ENV_SWAP_PROTECT`] and off for everything else in this module.
+const DISABLE_VALUES: [&str; 3] = ["0", "false", "off"];
 
 /// Slot count used when `ANIMA_SWAP_SLOTS` is unset or unparseable.
 const DEFAULT_SLOTS: usize = 3;
@@ -176,12 +203,14 @@ const EMPTY_POLL_BUDGET: std::time::Duration = std::time::Duration::from_millis(
 static TRACE: LazyLock<bool> = LazyLock::new(read_env_trace);
 
 /// The one-time initializer behind [`TRACE`].
+///
+/// Delegates to [`env_flag`] rather than repeating the membership check:
+/// before this change the tracing variable was one of the two callers of
+/// that reader, and the duplication is exactly the sort of thing that
+/// lets the two drift apart.
 fn read_env_trace() -> bool {
-    std::env::var(ENV_SWAP_TRACE).ok().is_some_and(|raw| {
-        ENABLE_VALUES
-            .iter()
-            .any(|v| v.eq_ignore_ascii_case(raw.trim()))
-    })
+    let raw = std::env::var(ENV_SWAP_TRACE).ok();
+    env_flag(raw.as_deref())
 }
 
 /// Resolve [`TRACE`] now, before the first focus event can observe it.
@@ -427,16 +456,229 @@ impl SlotPool {
     }
 }
 
-/* ── environment parsing ──────────────────────────────────────────── */
+/* ── focus settling ───────────────────────────────────────────────── */
 
-/// Whether a raw `ANIMA_SWAP_PROTECT`/`ANIMA_SWAP_TRACE` value arms the
-/// feature. Unset is off; so is anything but [`ENABLE_VALUES`].
+/// Name of the environment variable setting how long focus has to hold
+/// still before swap protection follows it.
+const ENV_SWAP_SETTLE: &str = "ANIMA_SWAP_SETTLE";
+
+/// Settle delay used when `ANIMA_SWAP_SETTLE` is unset or unparseable.
+///
+/// 250 ms is about the time a user dwells on a window before typing in
+/// it, and comfortably longer than an alt-tab. Anything shorter starts
+/// protecting windows nobody is going to type in; anything much longer
+/// leaves the window being typed in unprotected for a visible beat.
+const DEFAULT_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Upper bound on the settle delay, in milliseconds.
+///
+/// Unlike [`MAX_SLOTS`] this does not protect a resource — it protects
+/// the *point* of the feature. A settle longer than a few seconds means
+/// protection no longer follows the window being typed in, which is the
+/// whole reason the daemon listens to focus events at all. The bound
+/// turns a typo like `99999999` into a very conservative delay instead
+/// of a silently disabled feature.
+const MAX_SETTLE_MS: u64 = 5_000;
+
+/// What one focus event means for swap protection, as decided by
+/// [`FocusSettle`].
+///
+/// An intent, not an action — the same split [`SlotPool`] uses. Nothing
+/// here touches the filesystem, so the churn a missing buffer produces
+/// (a pin and unpin per keystroke of alt-tabbing) is observable in a
+/// unit test that needs no compositor, no real clock and no sleep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusOutcome {
+    /// The focused process is the one already being protected: nothing
+    /// to do, and any pending candidate is dropped.
+    Settled,
+    /// Focus moved, but has not held still long enough to be worth a
+    /// migration. Nothing is released and nothing is protected.
+    Settling,
+    /// This pid has held for the whole cooldown; migrate it in, then
+    /// [`FocusSettle::commit`] the result.
+    Apply(u32),
+}
+
+/// A one-event buffer in front of the swap-protection focus path.
+///
+/// A migration is not free: it is two `cgroup.procs` writes plus a
+/// `cpu.weight` mirror and a slot free/assign, and each one drops the
+/// `memory.swap.max` shield for the duration of the move. Cycled focus
+/// (A→B→C→A, or a user holding alt and grazing the window list) would
+/// pay that cost per event for a window nobody stays in, and the
+/// previously protected window would lose and regain protection
+/// pointlessly. This type exists so that only a focus which *holds* is
+/// acted on — while focus cycles, nothing here reports `Apply`, so
+/// nothing is released and nothing takes a slot.
+///
+/// Like [`SlotPool`] it holds only the decision half: `applied` is what
+/// the syscall layer currently has protected and `pending` is the
+/// candidate being watched, stamped with the instant it was *first*
+/// seen. That first-seen stamp is the load-bearing detail. Re-announcing
+/// the same pid must not restart the cooldown, or a focus that flickers
+/// between two windows every 200 ms would never settle and the buffer
+/// would degrade into "protection never moves".
+///
+/// The clock is a parameter, never read from the environment: the daemon
+/// is a single-threaded event loop that wakes only when Hyprland emits
+/// `activewindowv2`, so there is no tick to sample on the focus path.
+/// `observe` therefore compares against the instant it is *given* on the
+/// focus event itself and returns `Apply` as soon as the cooldown has
+/// elapsed — the caller has nothing else to poll. [`Self::settled`] is
+/// the same predicate for a caller that does drive a clock. Every method
+/// is pure arithmetic over instants, testable with synthetic ones.
+pub(crate) struct FocusSettle {
+    /// How long a candidate must be pending before it is applied.
+    cooldown: std::time::Duration,
+    /// The pid the syscall layer currently has protected, i.e. the last
+    /// one passed to [`Self::commit`].
+    applied: Option<u32>,
+    /// The candidate being watched, with the instant it was first seen.
+    pending: Option<(u32, std::time::Instant)>,
+}
+
+impl FocusSettle {
+    /// A buffer with the given cooldown and nothing applied.
+    ///
+    /// A zero cooldown means "no buffering": [`Self::observe`] answers
+    /// [`FocusOutcome::Apply`] on the first event, which is exactly the
+    /// behaviour the unsuffered synchronous focus path had.
+    pub(crate) fn new(cooldown: std::time::Duration) -> Self {
+        Self {
+            cooldown,
+            applied: None,
+            pending: None,
+        }
+    }
+
+    /// Record one `activewindowv2` event and say what to do about it.
+    ///
+    /// Seeing the applied pid again is a no-op that also drops whatever
+    /// was pending: focus came *back*, so the candidate that was being
+    /// watched is stale and must never be applied behind the applied
+    /// process's back. Any other pid becomes — or stays — the candidate,
+    /// keeping the instant it was first seen.
+    ///
+    /// The answer for a candidate that has already held the full cooldown
+    /// is [`FocusOutcome::Apply`], not `Settling`. That is what makes the
+    /// event-driven daemon workable: the loop only wakes on a focus
+    /// event, so the caller has nothing else to poll and cannot learn
+    /// about an elapsed cooldown unless this call reports it. A caller
+    /// that does drive a clock separately should ask
+    /// [`Self::settled`] instead.
+    ///
+    /// [`FocusOutcome::Apply`] is returned without recording anything:
+    /// the caller commits with [`Self::commit`] only once the migration
+    /// has actually succeeded, for the same reason [`SlotPool`] waits.
+    pub(crate) fn observe(&mut self, now: std::time::Instant, pid: u32) -> FocusOutcome {
+        if Some(pid) == self.applied {
+            self.pending = None;
+            return FocusOutcome::Settled;
+        }
+        let first = match self.pending {
+            // Same candidate still pending: keep the original stamp.
+            Some((pending_pid, first)) if pending_pid == pid => first,
+            _ => now,
+        };
+        // Zero cooldown, or the candidate has held long enough: apply now.
+        // `saturating_duration_since` keeps this safe for a `now` that
+        // went backwards (a synthetic or NTP-corrected instant).
+        if self.cooldown.is_zero() || now.saturating_duration_since(first) >= self.cooldown {
+            return FocusOutcome::Apply(pid);
+        }
+        self.pending = Some((pid, first));
+        FocusOutcome::Settling
+    }
+
+    /// The pid that has held the full cooldown, if any.
+    ///
+    /// Returns the candidate only once the cooldown has *continuously*
+    /// elapsed since it was first seen; a candidate that has not is
+    /// still `None`. It keeps reporting the same pid until the caller
+    /// [`Self::commit`]s it, so a poll that runs twice applies nothing
+    /// twice either.
+    ///
+    /// The daemon's loop has no reason to call this: it only wakes on a
+    /// focus event, and [`Self::observe`] already answers `Apply` once
+    /// the cooldown elapses, so a poll would add a second answer to the
+    /// same question. It is kept because it is the half of that decision
+    /// that is observable without going through `observe`'s side effects,
+    /// which is what makes the agreement between the two testable.
+    #[cfg(test)]
+    pub(crate) fn settled(&self, now: std::time::Instant) -> Option<u32> {
+        let (pid, first) = self.pending?;
+        (now.saturating_duration_since(first) >= self.cooldown).then_some(pid)
+    }
+
+    /// Record that `pid` is now protected.
+    ///
+    /// Called with the pid [`Self::observe`] just answered `Apply` for;
+    /// committing one that never settled is how a settle buffer turns into
+    /// no buffer at all. The pending candidate is dropped either way, so
+    /// an apply that fails costs the focus one more settle rather than a
+    /// bogus "already protected" answer.
+    pub(crate) fn commit(&mut self, pid: u32) {
+        self.applied = Some(pid);
+        self.pending = None;
+    }
+}
+
+/// Settle delay from `ANIMA_SWAP_SETTLE`, in milliseconds, clamped to a
+/// usable range.
+///
+/// Same shape as [`parse_slots`]: read once, clamp, garbage falls back to
+/// the default. Zero is *not* clamped away, unlike
+/// [`SlotPool::new`]'s count — a zero-length buffer is the meaningful
+/// "protect on the focus event itself" setting, not a broken pool.
+fn parse_settle(raw: Option<&str>) -> std::time::Duration {
+    let ms = raw
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SETTLE.as_millis() as u64);
+    std::time::Duration::from_millis(ms.min(MAX_SETTLE_MS))
+}
+
+/* ── the syscall layer ────────────────────────────────────────────── */
+
+/// Whether a raw `ANIMA_SWAP_TRACE` value enables tracing. Unset is off;
+/// so is anything but [`ENABLE_VALUES`].
+///
+/// NOT used for [`ENV_SWAP_PROTECT`], where unset means on — see
+/// [`swap_protect_enabled`]. The two variables deliberately carry
+/// opposite defaults, so they must not share a flag reader.
 fn env_flag(raw: Option<&str>) -> bool {
     raw.is_some_and(|v| {
         ENABLE_VALUES
             .iter()
             .any(|e| e.eq_ignore_ascii_case(v.trim()))
     })
+}
+
+/// Whether a raw `ANIMA_SWAP_PROTECT` value leaves protection on.
+///
+/// A tri-state, not a negation of [`env_flag`]: unset is *on* here, while
+/// unset is off for the tracing variable. `1`, `true` and `on` say so
+/// explicitly; anything else — `0`, `false`, `off` and equally `garbage`,
+/// `yes`, `2` and the empty string — is off, because this feature moves
+/// user processes between cgroups and a typo must never be read as
+/// consent. Telling "you asked for off" apart from "nobody could parse
+/// this" is [`is_disable_value`]'s job, not this function's: here both
+/// answer "protection stays off".
+fn swap_protect_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(v) => ENABLE_VALUES
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(v.trim())),
+    }
+}
+
+/// Whether a raw value is one of [`DISABLE_VALUES`], used to tell "you
+/// asked for off" apart from "nobody could parse this" in the log line.
+fn is_disable_value(raw: &str) -> bool {
+    DISABLE_VALUES
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(raw.trim()))
 }
 
 /// Slot count from `ANIMA_SWAP_SLOTS`, clamped to a usable range.
@@ -475,10 +717,18 @@ pub(crate) struct SwapGuard {
     /// only reachable for scopes this daemon can write — see
     /// [`RESTORE_TARGET`] — and when it is not, the leaf is used instead.
     restore_source: HashMap<u32, PathBuf>,
+    /// Debounces focus changes in front of [`Self::set_focus`], so focus
+    /// cycling does not pin and unpin a process per event. A no-op when
+    /// the cooldown is zero.
+    settle: FocusSettle,
 }
 
 impl SwapGuard {
     /// Read the environment once and build the pool if protection is on.
+    ///
+    /// On by default: an unset [`ENV_SWAP_PROTECT`] arms the pool, and
+    /// only an explicit `0`/`false`/`off` — or a value that cannot be
+    /// parsed, which is reported rather than assumed — leaves it off.
     ///
     /// Failure to create the cgroups is reported and downgraded to
     /// "off": swap protection is an enhancement and must never become a
@@ -487,11 +737,24 @@ impl SwapGuard {
         init_trace_from_env();
 
         let raw = std::env::var(ENV_SWAP_PROTECT).ok();
-        if !env_flag(raw.as_deref()) {
-            eprintln!(
-                "[anima] swapguard: off ({ENV_SWAP_PROTECT} unset or not {})",
-                ENABLE_VALUES.join("/")
-            );
+        if !swap_protect_enabled(raw.as_deref()) {
+            // The disabled branch can only be reached with a value that was
+            // present and parsed as anything other than an affirmative, so
+            // a distinguishing message for an unset variable would be dead
+            // code here. An empty value is a deliberate turn-off rather
+            // than a typo, and is worded as one.
+            let value = raw.as_deref().map(str::trim).unwrap_or_default();
+            if value.is_empty() {
+                eprintln!("[anima] swapguard: off ({ENV_SWAP_PROTECT} explicitly disabled)");
+            } else if is_disable_value(value) {
+                eprintln!("[anima] swapguard: off ({ENV_SWAP_PROTECT}={value})");
+            } else {
+                eprintln!(
+                    "[anima] swapguard: off ({ENV_SWAP_PROTECT}={value} not understood; \
+                     set {})",
+                    ENABLE_VALUES.join("/")
+                );
+            }
             return Self::disarmed();
         }
 
@@ -526,6 +789,7 @@ impl SwapGuard {
             pool: SlotPool::new(0),
             focus: None,
             restore_source: HashMap::new(),
+            settle: FocusSettle::new(std::time::Duration::ZERO),
         }
     }
 
@@ -580,12 +844,40 @@ impl SwapGuard {
             pool: SlotPool::new(count),
             focus: None,
             restore_source: HashMap::new(),
+            settle: FocusSettle::new(parse_settle(std::env::var(ENV_SWAP_SETTLE).ok().as_deref())),
         })
     }
 
     /// Whether protection is armed. Only used for logging and tests.
     pub(crate) fn is_enabled(&self) -> bool {
         self.parent.is_some()
+    }
+
+    /// Feed a focus event for `pid`, migrating only once it settles.
+    ///
+    /// The daemon's loop is event-driven and has no clock of its own, so
+    /// the buffer advances on focus events rather than on time: a focus
+    /// that does not hold still for the cooldown is never migrated, and
+    /// the window that already holds protection keeps it. Focus cycling
+    /// therefore costs nothing at all instead of a pin and unpin per
+    /// window seen.
+    ///
+    /// Only the cooldown deciding is delegated here; what a settled focus
+    /// does is still exactly [`Self::set_focus`], so the release of the
+    /// previous window and the protection of the new one happen once, in
+    /// the order they always did. A disarmed guard is left inert.
+    pub(crate) fn observe(&mut self, pid: u32) {
+        if self.parent.is_none() || pid < 1 {
+            return;
+        }
+        match self.settle.observe(std::time::Instant::now(), pid) {
+            FocusOutcome::Apply(pid) => {
+                self.settle.commit(pid);
+                self.set_focus(pid);
+            }
+            FocusOutcome::Settling => trace!("focus {pid}: settling, nothing migrated yet"),
+            FocusOutcome::Settled => trace!("focus {pid}: already protected"),
+        }
     }
 
     /// Protect `pid`, releasing the previously focused PID first.
@@ -721,6 +1013,7 @@ impl SwapGuard {
         self.restore = None;
         self.pool = SlotPool::new(0);
         self.restore_source.clear();
+        self.settle = FocusSettle::new(std::time::Duration::ZERO);
         trace!("torn down");
     }
 
@@ -1050,6 +1343,7 @@ mod tests {
                     pool: SlotPool::new(slots),
                     focus: None,
                     restore_source: HashMap::new(),
+                    settle: FocusSettle::new(std::time::Duration::ZERO),
                 },
                 restored: Vec::new(),
                 entered: Vec::new(),
@@ -1408,13 +1702,58 @@ mod tests {
         assert!(restore_source.is_empty());
     }
 
+    /// The tri-state. Unset is on — the whole point of the default — and
+    /// both spellings of "yes" and "no" agree, case-insensitively.
     #[test]
-    fn protection_is_opt_in_and_rejects_everything_but_affirmatives() {
-        for on in ["1", "true", "on", "TRUE", "On"] {
-            assert!(env_flag(Some(on)), "{on} should arm the feature");
+    fn swap_protection_defaults_on_and_honours_an_explicit_opt_out() {
+        assert!(swap_protect_enabled(None), "unset must arm the feature");
+
+        for on in ["1", "true", "on", "TRUE", "On", "  on  "] {
+            assert!(
+                swap_protect_enabled(Some(on.trim())),
+                "{on} should arm the feature"
+            );
+        }
+        for off in ["0", "false", "off", "FALSE", "Off", "  0  "] {
+            assert!(
+                !swap_protect_enabled(Some(off.trim())),
+                "{off} should disarm the feature"
+            );
+        }
+    }
+
+    /// The safety property, and the reason this is a tri-state rather than
+    /// a negation of `env_flag`: a value nobody can parse must not leave
+    /// the feature on. `ANIMA_SWAP_PROTECT=yes` reads like a yes to a
+    /// human, and `2` looks like a slot count, but neither arm anything —
+    /// and the only way a typo like that is harmless is if it disarms.
+    #[test]
+    fn a_value_that_cannot_be_parsed_disarms_rather_than_arming() {
+        for garbage in ["yes", "no", "2", "y", "n", "of", "offf", "", "  ", "-1"] {
+            assert!(
+                !swap_protect_enabled(Some(garbage)),
+                "{garbage:?} must not arm the feature"
+            );
+        }
+        // And the daemon says so at start, rather than failing silently:
+        // a reader who typed a wrong value has to be able to see it.
+        for garbage in ["yes", "2", ""] {
+            assert!(
+                !is_disable_value(garbage),
+                "{garbage:?} is not an opt-out word, so it must be reported as unparsed"
+            );
+        }
+    }
+
+    /// Unchanged by the default flip: the tracing variable is still
+    /// opt-in, where an unset value means silent.
+    #[test]
+    fn trace_stays_opt_in() {
+        for on in ["1", "true", "on", "On"] {
+            assert!(env_flag(Some(on)), "{on} should enable tracing");
         }
         for off in ["", "off", "0", "false", "no", "yes", "2"] {
-            assert!(!env_flag(Some(off)), "{off} should not arm the feature");
+            assert!(!env_flag(Some(off)), "{off} should not enable tracing");
         }
         assert!(!env_flag(None));
     }
@@ -1445,5 +1784,332 @@ mod tests {
         let rel = text.lines().find_map(|l| l.strip_prefix("0::"));
 
         assert_eq!(rel, Some("/user.slice/app.slice"));
+    }
+
+    /* ── focus settling ───────────────────────────────────────────── */
+
+    /// Drive a [`FocusSettle`] the way [`SwapGuard`]'s event loop will:
+    /// every focus event is observed, the outcome decides whether the
+    /// syscall layer is touched, and an `Apply` is committed. The stub
+    /// records what would have happened to the pool, so a test asserts
+    /// on migrations rather than on the buffer's fields.
+    struct SettleStub<'a> {
+        settle: FocusSettle,
+        pool: &'a mut SlotPool,
+        /// PIDs the syscall layer would have protected, in order.
+        entered: Vec<(usize, u32)>,
+        /// Pids it would have restored (evicted, or the previous focus),
+        /// in order.
+        restored: Vec<u32>,
+        /// What the settle buffer last committed as applied.
+        applied: Option<u32>,
+        clock: std::time::Instant,
+    }
+
+    impl<'a> SettleStub<'a> {
+        fn new(cooldown: std::time::Duration, pool: &'a mut SlotPool) -> Self {
+            Self {
+                settle: FocusSettle::new(cooldown),
+                pool,
+                entered: Vec::new(),
+                restored: Vec::new(),
+                applied: None,
+                clock: std::time::Instant::now(),
+            }
+        }
+
+        /// One `activewindowv2` event for a pid that must NOT be acted
+        /// on: the dwell since the previous event is shorter than the
+        /// cooldown, so this is focus that has not held still.
+        fn announce(&mut self, delta_ms: u64, pid: u32) {
+            self.clock += std::time::Duration::from_millis(delta_ms);
+            assert_eq!(
+                self.settle.observe(self.clock, pid),
+                FocusOutcome::Settling,
+                "focus on {pid} after {delta_ms}ms of dwell must still settle"
+            );
+        }
+
+        /// One event for a pid that DOES deserve a migration: either the
+        /// cooldown has elapsed since it was first announced, or the
+        /// cooldown is zero.
+        fn hold(&mut self, delta_ms: u64, pid: u32) {
+            self.clock += std::time::Duration::from_millis(delta_ms);
+            // Event-driven callers learn the cooldown has elapsed from
+            // the observe call itself. `settled` is the same predicate
+            // and must agree with it, so check both.
+            assert_eq!(self.settle.settled(self.clock), Some(pid));
+            assert_eq!(
+                self.settle.observe(self.clock, pid),
+                FocusOutcome::Apply(pid)
+            );
+        }
+
+        /// One event for the pid already being protected.
+        fn back(&mut self, delta_ms: u64, pid: u32) {
+            self.clock += std::time::Duration::from_millis(delta_ms);
+            assert_eq!(self.settle.observe(self.clock, pid), FocusOutcome::Settled);
+        }
+
+        /// The migration `set_focus` would perform for a committed pid:
+        /// release the previous focus, then take a slot for the new one.
+        fn commit(&mut self, pid: u32) {
+            // `applied` is what the settle buffer thinks the syscall
+            // layer is protecting, which is what `set_focus` releases.
+            if let Some(prev) = self.applied.take() {
+                if prev != pid {
+                    match self.pool.plan_release(prev) {
+                        ReleasePlan::Free { .. } => {
+                            self.restored.push(prev);
+                            self.pool.commit_release(self.pool.plan_release(prev));
+                        }
+                        ReleasePlan::NotProtected => {}
+                    }
+                }
+            }
+            match self.pool.plan_protect(pid) {
+                SlotPlan::Take { slot, evict } => {
+                    if let Some(old) = evict {
+                        self.restored.push(old);
+                    }
+                    self.entered.push((slot, pid));
+                    self.pool
+                        .commit_protect(SlotPlan::Take { slot, evict }, pid);
+                }
+                SlotPlan::Already | SlotPlan::NoSlots => {}
+            }
+            self.applied = Some(pid);
+            self.settle.commit(pid);
+        }
+    }
+
+    /// The bug this buffer exists for. Without it every one of these
+    /// events is a migration: three restores and three slot entries for
+    /// a user who never stayed anywhere, and a protected window that is
+    /// unprotected four times over.
+    #[test]
+    fn cycled_focus_never_migrates_anything() {
+        let mut pool = SlotPool::new(3);
+        let mut stub = SettleStub::new(parse_settle(None), &mut pool);
+        let cooldown = parse_settle(None);
+
+        // The user sits on 100 long enough for it to be protected: first
+        // announced, then dwelled on past the cooldown.
+        stub.announce(0, 100);
+        stub.hold(cooldown.as_millis() as u64 + 1, 100);
+        stub.commit(100);
+
+        // Then cycles through B and C repeatedly, never dwelling longer
+        // than the cooldown. Each event is only an announcement, and
+        // returning to A is a no-op that drops the candidate.
+        for pid in [200, 300, 200, 300, 200] {
+            stub.announce(50, pid);
+        }
+        stub.back(50, 100);
+
+        // Nothing moved: 100 is still the only occupant of the pool, in
+        // the slot it already held, with no restore and no eviction. No
+        // candidate has accumulated the cooldown either, which is the
+        // state migration churn would have come from.
+        assert_eq!(stub.entered, vec![(0, 100)]);
+        assert!(stub.restored.is_empty());
+        assert_eq!(
+            stub.settle.settled(stub.clock),
+            None,
+            "a cycling candidate must never look settled"
+        );
+        assert_eq!(stub.pool.slot_of(100), Some(0));
+        // Exactly one occupant: the pool did not fill with the cycled
+        // candidates, so nothing was ever migrated for them.
+        assert_eq!(stub.pool.plan_release_all().len(), 1);
+    }
+
+    /// The other half of the contract: the buffer must not swallow a
+    /// focus that *did* hold. A settle that never fills is
+    /// indistinguishable from the feature being off.
+    #[test]
+    fn a_focus_that_holds_is_applied_exactly_once() {
+        let mut pool = SlotPool::new(3);
+        let mut stub = SettleStub::new(parse_settle(None), &mut pool);
+        let cooldown = parse_settle(None);
+
+        stub.announce(0, 100);
+        stub.hold(cooldown.as_millis() as u64 + 1, 100);
+        stub.commit(100);
+        // Focus moves on and stays there.
+        stub.announce(200, 200);
+        stub.hold(cooldown.as_millis() as u64 + 1, 200);
+        stub.commit(200);
+
+        assert_eq!(stub.entered, vec![(0, 100), (0, 200)]);
+        assert_eq!(stub.restored, vec![100]);
+        // The applied focus is at rest in the pool and must not be
+        // applied a second time by a later event.
+        stub.back(500, 200);
+        assert_eq!(stub.entered.len(), 2);
+        assert_eq!(stub.pool.slot_of(200), Some(0));
+    }
+
+    /// The cooldown is measured from the *first* sighting of a candidate,
+    /// so re-announcing the same pid cannot push it out forever. A buffer
+    /// that restarted its cooldown on every repeat would never settle for
+    /// a window that flickers, or that Hyprland re-announces.
+    #[test]
+    fn re_announcing_a_pending_pid_does_not_restart_the_cooldown() {
+        let mut settle = FocusSettle::new(DEFAULT_SETTLE);
+        let t0 = std::time::Instant::now();
+        let mut now = t0;
+
+        now += std::time::Duration::from_millis(10);
+        assert_eq!(
+            settle.observe(now, 200),
+            FocusOutcome::Settling,
+            "the first sighting starts the clock"
+        );
+        // Dwell 100 ms, then re-announce the same pid twice more. A
+        // restarting cooldown would still be Settling at each of these,
+        // because none of them is 250 ms after the previous one.
+        for _ in 0..2 {
+            now += std::time::Duration::from_millis(100);
+            assert_eq!(settle.observe(now, 200), FocusOutcome::Settling);
+        }
+        // 210 ms since the first sighting: past the cooldown without any
+        // single dwell having reached it, so only a first-seen stamp can
+        // possibly settle this focus.
+        now += std::time::Duration::from_millis(60);
+        assert_eq!(settle.observe(now, 200), FocusOutcome::Apply(200));
+    }
+
+    /// Focus leaving the applied pid mid-settle and coming *back* to it
+    /// must discard the candidate, or a window the user returned to
+    /// would be swapped out for the one they left.
+    #[test]
+    fn seeing_the_applied_pid_again_drops_the_pending_candidate() {
+        let mut settle = FocusSettle::new(DEFAULT_SETTLE);
+        let t0 = std::time::Instant::now();
+
+        settle.observe(t0, 100);
+        assert_eq!(
+            settle.observe(t0 + std::time::Duration::from_millis(251), 100),
+            FocusOutcome::Apply(100)
+        );
+        settle.commit(100);
+        // 200 is being watched...
+        assert_eq!(
+            settle.observe(t0 + std::time::Duration::from_millis(260), 200),
+            FocusOutcome::Settling
+        );
+        // ...but focus returns to 100. 200 has not held the cooldown and
+        // must never be applied behind 100's back.
+        assert_eq!(
+            settle.observe(t0 + std::time::Duration::from_millis(50), 100),
+            FocusOutcome::Settled
+        );
+        assert_eq!(
+            settle.settled(t0 + std::time::Duration::from_secs(10)),
+            None
+        );
+    }
+
+    /// No buffer at all: the first focus event of a new pid is acted on
+    /// immediately, which is the path the daemon had before the settle
+    /// existed. A zero cooldown must not become "never protect".
+    #[test]
+    fn a_zero_cooldown_applies_on_the_focus_event_itself() {
+        let mut settle = FocusSettle::new(std::time::Duration::ZERO);
+        let t0 = std::time::Instant::now();
+
+        settle.observe(t0, 100);
+        assert_eq!(
+            settle.observe(t0 + std::time::Duration::from_millis(251), 100),
+            FocusOutcome::Apply(100)
+        );
+        settle.commit(100);
+        assert_eq!(settle.observe(t0, 100), FocusOutcome::Settled);
+        assert_eq!(settle.observe(t0, 200), FocusOutcome::Apply(200));
+    }
+
+    /// An already applied pid is `Settled`, never `Apply`: the answer
+    /// must distinguish "nothing to do" from "migrate", or every
+    /// duplicate Hyprland event becomes a migration.
+    #[test]
+    fn an_applied_pid_is_settled_not_applied() {
+        let mut settle = FocusSettle::new(DEFAULT_SETTLE);
+        let t0 = std::time::Instant::now();
+
+        settle.observe(t0, 100);
+        assert_eq!(
+            settle.observe(t0 + std::time::Duration::from_millis(251), 100),
+            FocusOutcome::Apply(100)
+        );
+        settle.commit(100);
+
+        assert_eq!(
+            settle.observe(t0 + std::time::Duration::from_secs(1), 100),
+            FocusOutcome::Settled
+        );
+        // And it must not be remembered as a candidate either, so no
+        // amount of dwell can resurrect it as a focus change.
+        assert_eq!(
+            settle.settled(t0 + std::time::Duration::from_secs(10)),
+            None
+        );
+    }
+
+    /// `settled` agrees with `observe` on the same instant. Two sources
+    /// of truth for "the cooldown has elapsed" is how a settle buffer
+    /// ends up reporting a focus as applied while the loop disagrees.
+    #[test]
+    fn settled_reports_the_same_candidate_as_observe_does() {
+        let mut settle = FocusSettle::new(parse_settle(Some("300")));
+        let t0 = std::time::Instant::now();
+
+        settle.observe(t0, 200);
+        assert_eq!(
+            settle.settled(t0 + std::time::Duration::from_millis(299)),
+            None
+        );
+        assert_eq!(
+            settle.settled(t0 + std::time::Duration::from_millis(300)),
+            Some(200)
+        );
+        // Still the same candidate until something commits it.
+        assert_eq!(
+            settle.settled(t0 + std::time::Duration::from_secs(5)),
+            Some(200)
+        );
+        assert_eq!(
+            settle.observe(t0 + std::time::Duration::from_secs(5), 200),
+            FocusOutcome::Apply(200)
+        );
+    }
+
+    /// A typo in the settle delay lands on a sane value, not on a
+    /// feature that never fires — and the clamp is what stops a typo
+    /// like `99999999` from turning protection off for the day.
+    #[test]
+    fn a_typo_in_the_settle_delay_is_clamped_not_obeyed() {
+        assert_eq!(parse_settle(None), DEFAULT_SETTLE);
+        assert_eq!(parse_settle(Some("garbage")), DEFAULT_SETTLE);
+        assert_eq!(parse_settle(Some(" 250 ")), DEFAULT_SETTLE);
+        assert_eq!(parse_settle(Some("0")), std::time::Duration::ZERO);
+        assert_eq!(parse_settle(Some("-1")), DEFAULT_SETTLE);
+        assert_eq!(
+            parse_settle(Some("120")),
+            std::time::Duration::from_millis(120)
+        );
+        // Clamped, not obeyed.
+        assert_eq!(
+            parse_settle(Some("99999999")),
+            std::time::Duration::from_millis(MAX_SETTLE_MS)
+        );
+    }
+
+    /// The variable a user sets must be the one that is parsed: an env
+    /// name change with no matching rename here silently reverts every
+    /// operator to the default.
+    #[test]
+    fn the_settle_env_variable_is_the_documented_name() {
+        assert_eq!(ENV_SWAP_SETTLE, "ANIMA_SWAP_SETTLE");
     }
 }

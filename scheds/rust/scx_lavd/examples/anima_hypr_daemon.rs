@@ -67,9 +67,11 @@ const AUDIO_BOOST_DEFAULT: &str = "on";
 
 /* ── swap-protection constants ─────────────────────────────────────── */
 
-/// Label for the off state of `ANIMA_SWAP_PROTECT` in the startup line,
-/// so the printed default and the code agree.
-const SWAP_PROTECT_DEFAULT: &str = "off";
+/// Label for the state of `ANIMA_SWAP_PROTECT` in the startup line, so
+/// the printed default and the code agree: unset or `1`/`true`/`on` arms
+/// the pool, and only `0`/`false`/`off` — or an unparseable value — turns
+/// it off.
+const SWAP_PROTECT_DEFAULT: &str = "on";
 
 /* ── data structures ───────────────────────────────────────────────── */
 
@@ -657,9 +659,9 @@ mod tests {
 
     /// Swap protection is the only step in the focus-event path that is
     /// allowed to fail, so it has to be independent of the boost path
-    /// rather than merely ordered after it. `SwapGuard` is disarmed by
-    /// default, so this asserts what production actually runs when
-    /// `ANIMA_SWAP_PROTECT` is unset.
+    /// rather than merely ordered after it. The guard arms by default, so
+    /// this asserts that an explicitly disarmed one stays inert — which is
+    /// what production runs when `ANIMA_SWAP_PROTECT=0/false/off` is set.
     #[test]
     fn a_disarmed_swapguard_is_inert_and_keeps_no_state() {
         let mut guard = SwapGuard::disarmed_for_test();
@@ -688,10 +690,10 @@ fn main() -> Result<()> {
 
     /* Swap protection for the focused window: the process owning it is
      * moved into a cgroup with `memory.swap.max = 0`, so what it
-     * allocates from now on cannot be pushed out to swap. Off unless
-     * ANIMA_SWAP_PROTECT=1/true/on, and every failure is contained — an
-     * unusable cgroup leaves the window swappable, which is the
-     * pre-existing behaviour, not a regression.
+     * allocates from now on cannot be pushed out to swap. On by default;
+     * ANIMA_SWAP_PROTECT=0/false/off turns it off, and every failure is
+     * contained — an unusable cgroup leaves the window swappable, which is
+     * the pre-existing behaviour, not a regression.
      *
      * Deliberately first, BEFORE the pinned BPF maps are opened: swap
      * protection is a userspace cgroup concern and needs no scheduler or
@@ -708,7 +710,7 @@ fn main() -> Result<()> {
         if swapguard.lock().map(|g| g.is_enabled()).unwrap_or(false) {
             "armed"
         } else {
-            SWAP_PROTECT_DEFAULT
+            "off"
         },
         SWAP_PROTECT_DEFAULT
     );
@@ -894,9 +896,14 @@ fn main() -> Result<()> {
          * costing anything, so it must never be able to interrupt the
          * map update above. A poisoning guard is recovered from rather
          * than propagated for the same reason — swap protection that
-         * took down the daemon would be strictly worse than none. */
+         * took down the daemon would be strictly worse than none.
+         *
+         * Routed through `observe`, not `set_focus`, so a focus that
+         * flits from window to window under the settle cooldown costs
+         * nothing: the previous window keeps its slot rather than being
+         * unpinned and repinned once per event. */
         match swapguard.lock() {
-            Ok(mut sg) => sg.set_focus(pid),
+            Ok(mut sg) => sg.observe(pid),
             Err(e) => eprintln!("[anima] swapguard: lock: {e}"),
         }
     }
