@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# AnimAIOS Hyprland focus daemon (BORE/EEVDF boost) — system service
+#
+# Replaces `anima-hypr.service` (the user service) when the machine boots
+# a BORE-patched kernel. The user service's BPF-map pump had no consumer
+# there — `sched_ext` is `disabled`, and scx_lavd's pinned
+# `anima_active_pids` map is never created, so the daemon crash-looped
+# reading the missing pin. This unit runs the BORE backend instead, which
+# drives the scheduler through plain per-task syscalls and a
+# daemon-owned cgroup.
+#
+# Why a system service (not the previous user service)?
+#   Raising a process's priority above the daemon's own nice requires
+#   CAP_SYS_NICE: the whole point of the boost is to raise the focused
+#   window above nice 0, which an unprivileged daemon cannot do for
+#   another process. ananicy-cpp runs as root for the same class of
+#   reason. Running as root also makes the boost cgroup land under the
+#   root slice, where the cpu controller is always delegated.
+#
+# The trade-off: a system service does not inherit the graphical
+# session's environment, and the daemon needs HYPRLAND_INSTANCE_SIGNATURE
+# and XDG_RUNTIME_DIR to reach Hyprland's `.socket2.sock`. Those are
+# bridged by the pass-through below — the daemon is started per-user, so
+# the signature is read from the running session's socket directory at
+# start time rather than baked in.
+#
+# Install (replace the user unit, or keep both and pick one):
+#   systemctl --user disable --now anima-hypr.service
+#   sudo install -Dm644 services/anima-hypr-system.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now anima-hypr-system@1000.service   # uid as arg
+#   journalctl -u anima-hypr-system@1000.service -f
+#
+# The daemon itself needs no root if the cgroup half of the boost is
+# unavailable; it reports that and continues with nice-only writes.
+
+[Unit]
+Description=AnimAIOS Hyprland focus daemon — BORE/EEVDF boost for %i
+# Hyprland must own the socket the daemon subscribes to, and the session
+# it names must already exist.
+After=graphical-session.target hyprland-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# %i is the uid of the graphical session this unit serves.
+Environment=ANIMA_USER_UID=%i
+
+# Bridge Hyprland's IPC into a root daemon. A system unit cannot inherit
+# the session's environment, so the instance signature is read from the
+# session's socket directory at start time and written where the daemon
+# reads it. `Environment=` cannot do this — it takes no substitutions
+# from the filesystem — so the file below is the bridge.
+EnvironmentFile=/run/anima/hypr-env-%i.conf
+
+# Where the boost cgroup is created. Omitted, the daemon derives it from
+# its own `/proc/self/cgroup` and lands on the root slice when that
+# derivation finds no `user@*.service` — the documented, working
+# fallback, but NOT what we want under a per-user unit. Pointing at the
+# user's delegated slice means the boost cgroup is owned by the session
+# and torn down with it, and carries `cpu memory pids` delegation for
+# free (verified on this box).
+Environment=ANIMA_BOOST_CGROUP=/sys/fs/cgroup/user.slice/user-%i.slice/user@%i.service/anima_boost
+
+# window+tree: boost focused PID + its low-CPU direct children. Switch to
+# just "window" if you want the focused process only (no descendants).
+ExecStart=/usr/local/bin/anima-hypr-daemon window+tree
+
+Restart=on-failure
+RestartSec=3
+# An unbounded restart loop was the failure mode of the BPF backend: the
+# daemon spun 1705 times against a missing pin before anyone noticed.
+# Bounded here so a genuinely broken environment gives up loudly instead.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Hardening. The daemon needs CAP_SYS_NICE to raise the focused process
+# and write to a cgroup; nothing else.
+NoNewPrivileges=no
+CapabilityBoundingSet=CAP_SYS_NICE CAP_CHOWN CAP_DAC_OVERRIDE
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
