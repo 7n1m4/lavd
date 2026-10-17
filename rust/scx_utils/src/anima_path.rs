@@ -14,7 +14,9 @@ pub fn anima_tab_sock() -> PathBuf {
         }
     }
     #[allow(clippy::disallowed_methods)]
-    let cache = std::env::var_os("HOME")
-        .map_or_else(|| PathBuf::from("/tmp"), |h| PathBuf::from(h).join(".cache"));
+    let cache = std::env::var_os("HOME").map_or_else(
+        || PathBuf::from("/tmp"),
+        |h| PathBuf::from(h).join(".cache"),
+    );
     cache.join("anima").join("tab.sock")
 }
