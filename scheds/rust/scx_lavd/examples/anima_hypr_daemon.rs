@@ -7,11 +7,13 @@
 //! under load.
 //!
 //! Architecture (post-polish, see git log):
-//! - Per-task booster via `setpriority(2)` + a daemon-owned cgroup's
-//!   `cpu.weight` — the actuators that actually drive BORE/EEVDF. The
-//!   BPF-map path needed `scx_lavd`, and `sched_ext` is `disabled` on
-//!   BORE-patched kernels, so the map pump had no consumer. See
-//!   `anima_boost.rs`.
+//! - One actuator, chosen at runtime. When `scx_lavd` is running the
+//!   focused PIDs go into the pinned `anima_active_pids` BPF map and
+//!   LAVD gives them the highest virtual deadline. When it is not — as
+//!   on BORE-patched kernels, where `sched_ext` is `disabled` — the same
+//!   PID set drives `setpriority(2)` plus a cgroup `cpu.weight` instead.
+//!   The detection lives in [`anima_bpf`] and [`anima_boost`]; see
+//!   [`Backend`] for how the choice is made.
 //! - Incremental reconciliation: only the PIDs that gained or lost the
 //!   boost are touched; a repeated focus event costs nothing
 //! - PID cache: read `hyprctl clients -j` once at startup, no per-event
@@ -33,6 +35,8 @@ use anyhow::{Context, Result};
 
 mod anima_audio;
 use anima_audio::AudioEvent;
+mod anima_bpf;
+use anima_bpf::{BpfBooster, SchedProbe};
 mod anima_boost;
 use anima_boost::Booster;
 mod anima_swap;
@@ -64,11 +68,138 @@ const AUDIO_BOOST_DEFAULT: &str = "on";
 /// it off.
 const SWAP_PROTECT_DEFAULT: &str = "on";
 
+/* ── actuator selection ────────────────────────────────────────────── */
+
+/// Which actuator the daemon should drive, as asked for by the operator.
+///
+/// `ANIMA_BACKEND` is the only input, and it is deliberately not the same
+/// thing as [`Backend`]: a request can be refused, whereas the backend
+/// the daemon actually ends up with cannot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BackendSelection {
+    /// Prefer scx_lavd's BPF map, fall back to nice when it is not
+    /// usable. The default, and the only value that works on both a
+    /// `sched_ext` host and a BORE host without reconfiguration.
+    Auto,
+    /// scx_lavd's BPF map only. An explicit demand, so an unavailable
+    /// scheduler is an error rather than something to paper over.
+    Eevdf,
+    /// Nice + cgroup weight only. Always available, because it needs
+    /// neither a BPF scheduler nor root for its nice-only mode.
+    Nice,
+}
+
+impl BackendSelection {
+    /// Parse `ANIMA_BACKEND`. Unknown values become `Auto` rather than
+    /// an error: a typo'd variable should not stop the daemon from
+    /// boosting the focused window, and `Auto` is what it meant.
+    fn from_env(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "eevdf" | "bpf" | "lavd" => Self::Eevdf,
+            "nice" | "setpriority" | "no-bpf" | "no_bpf" => Self::Nice,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// The actuator the daemon actually drives, resolved once at startup.
+///
+/// Two variants rather than a `Box<dyn>` on purpose: the two actuators
+/// share only `reconcile`/`release_all`/`describe`, the nice one also
+/// has to keep working when the cgroup half is gone, and a trait object
+/// would buy nothing at exactly one object with a static lifetime.
+enum Backend {
+    /// scx_lavd's pinned BPF map, giving continuous 0..1024 lat_cri.
+    Eevdf(Box<BpfBooster>),
+    /// `setpriority` plus a cgroup `cpu.weight`.
+    Nice(Box<Booster>),
+}
+
+impl Backend {
+    /// Reconcile `desired` against what is currently boosted.
+    ///
+    /// Never fails and never aborts: an actuator that cannot apply its
+    /// boost reports it once and keeps running, because the daemon's job
+    /// is to observe focus, not to police its own success.
+    fn reconcile(&mut self, desired: &HashSet<u32>) {
+        match self {
+            Self::Eevdf(b) => b.reconcile(desired),
+            Self::Nice(b) => b.reconcile(desired),
+        }
+    }
+
+    /// Release every boost. Called on SIGINT/SIGTERM, so a crash cannot
+    /// leave the focused window permanently boosted.
+    fn release_all(&mut self) {
+        match self {
+            Self::Eevdf(b) => b.release_all(),
+            Self::Nice(b) => b.release_all(),
+        }
+    }
+
+    /// One-line summary of the live configuration, for the startup log.
+    fn describe(&self) -> String {
+        match self {
+            Self::Eevdf(b) => b.describe(),
+            Self::Nice(b) => b.describe(),
+        }
+    }
+}
+
+/// The backend `ANIMA_BACKEND` asks for, `Auto` when unset or unusable.
+pub(crate) fn requested_backend() -> BackendSelection {
+    BackendSelection::from_env(&std::env::var("ANIMA_BACKEND").unwrap_or_default())
+}
+
+/// Resolve [`BackendSelection`] into a live [`Backend`].
+///
+/// `auto` probes and prefers the BPF map. `eevdf` demands it and errors
+/// out when it is not there — an operator who asked for one backend
+/// explicitly should learn that it is missing rather than silently get
+/// the other one. `nice` skips the probe entirely: there is nothing to
+/// detect, the nice actuator is always constructible.
+fn select_backend(selection: BackendSelection) -> Result<Backend> {
+    // `nice` needs no probe: the actuator is always constructible, and
+    // consulting `/sys` would be work spent on an answer already known.
+    if selection == BackendSelection::Nice {
+        return Ok(Backend::Nice(Box::new(Booster::from_env())));
+    }
+
+    // The probe opens both pins, which is the same work `open()` would
+    // do — so once it reports `available` the open cannot fail. There is
+    // deliberately no `match` on its `Err`: it is unreachable, and an
+    // unreachable arm in the path that picks an actuator is where a
+    // latent bug would hide. If `open()` ever grows a genuinely new
+    // failure mode this needs re-examining, not a quiet arm added.
+    let probe = SchedProbe::detect();
+    if probe.available {
+        return Ok(Backend::Eevdf(Box::new(BpfBooster::open()?)));
+    }
+
+    // Unusable. `auto` says so and carries on, because the daemon's job
+    // is to boost the focused window, not to insist on a specific knob.
+    // An explicit `eevdf` is an operator's decision, so overruling it
+    // silently would hide the misconfiguration behind a working daemon.
+    if selection == BackendSelection::Eevdf {
+        anyhow::bail!(
+            "ANIMA_BACKEND=eevdf but the BPF map is not usable: {}",
+            probe.reason
+        );
+    }
+    eprintln!("[anima] {}; using nice instead", probe.reason);
+
+    let booster = Booster::from_env();
+    // A `Box` so the enum's two variants stay the same size: the BPF
+    // booster holds several map handles, and clippy would otherwise
+    // flag the large-enum-variant asymmetry anyway.
+    Ok(Backend::Nice(Box::new(booster)))
+}
+
 /* ── data structures ───────────────────────────────────────────────── */
 
 /// Per-task booster + CPU accounting state for child-filtering.
 struct Animamap {
-    booster: Booster,
+    booster: Backend,
     cpu: CpuFilter,
     boost: BoostState,
     /// Live PipeWire stream count per PID. A PID holds the boost while it
@@ -126,7 +257,7 @@ impl BoostState {
 /// Reconciliation is `anima_boost::BoostPlan` — the BPF `MapDiff` moved
 /// there with the actuator. Its diff/release invariants are tested in
 /// that module, where they no longer depend on root or a live scheduler.
-
+///
 /// Fold one PipeWire stream event into the per-PID live-stream count.
 ///
 /// Pure so the ref-counting can be tested without a PipeWire connection.
@@ -148,15 +279,22 @@ fn adjust_refs(refs: &mut HashMap<u32, usize>, event: AudioEvent) {
 }
 
 impl Animamap {
-    /// Build the booster and the child-CPU filter.
+    /// Build the actuator and the child-CPU filter.
     ///
     /// No prerequisite daemon and no privileges: every actuator here is
     /// a plain per-task syscall plus a daemon-owned cgroup write, so the
     /// daemon starts whether or not `scx_lavd` is running. Failures
     /// degrade to nice-only and are reported at the point they occur.
     fn open() -> Result<Self> {
+        let booster = select_backend(requested_backend())?;
+        match &booster {
+            Backend::Eevdf(_) => eprintln!("[anima] actuator: eevdf (scx_lavd BPF map)"),
+            Backend::Nice(_) => eprintln!("[anima] actuator: nice (setpriority + cgroup)"),
+        }
+        eprintln!("[anima] {}", booster.describe());
+
         Ok(Self {
-            booster: Booster::from_env(),
+            booster,
             cpu: CpuFilter::new(
                 DEFAULT_CHILD_MAX_CPU,
                 Duration::from_millis(DEFAULT_SAMPLE_MILLIS),
@@ -565,6 +703,86 @@ mod tests {
         assert!(!guard.is_enabled());
         assert!(guard.is_idle_for_test());
     }
+
+    /* ── actuator selection ─────────────────────────────────────────── */
+
+    #[test]
+    fn an_unset_or_garbage_backend_request_means_auto() {
+        // The interesting property is that a typo costs nothing: the
+        // daemon still boosts the focused window, as `auto` meant.
+        // Note `autoo` and `EEVFD` here — close to real values but not
+        // them, which is exactly the typo class this is about.
+        for raw in ["", "   ", "auto o", "autoo", "EEVFD", "force", "yes"] {
+            assert_eq!(
+                BackendSelection::from_env(raw),
+                BackendSelection::Auto,
+                "{raw:?} must not be a backend"
+            );
+        }
+    }
+
+    #[test]
+    fn known_backend_names_and_their_aliases_resolve() {
+        // Three ways to say each thing, because operators reach for all
+        // of them and none of them is more correct than the others.
+        // Whitespace and case are normalized, so a value pasted with a
+        // stray newline still resolves.
+        for raw in ["eevdf", "BPF", "Lavd", "bpf\n"] {
+            assert_eq!(
+                BackendSelection::from_env(raw),
+                BackendSelection::Eevdf,
+                "{raw:?}"
+            );
+        }
+        for raw in ["nice", "setpriority", "no-bpf", "NO_BPF"] {
+            assert_eq!(
+                BackendSelection::from_env(raw),
+                BackendSelection::Nice,
+                "{raw:?}"
+            );
+        }
+        for raw in ["auto", "AUTO", " auto "] {
+            assert_eq!(
+                BackendSelection::from_env(raw),
+                BackendSelection::Auto,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn requesting_nice_never_probes_and_always_yields_the_nice_actuator() {
+        // No filesystem read happens here, which is the point: `nice` is
+        // not a detection problem. Asserting the variant is the only
+        // observable contract, and `select_backend` returns it without
+        // touching /sys at all.
+        let backend = select_backend(BackendSelection::Nice).expect("nice is always constructible");
+        match backend {
+            Backend::Eevdf(_) => panic!("ANIMA_BACKEND=nice must not build the BPF actuator"),
+            Backend::Nice(_) => {}
+        }
+    }
+
+    #[test]
+    fn an_unavailable_bpf_backend_is_only_an_error_when_it_was_demanded() {
+        // `select_backend` probes the live machine, so this asserts only
+        // the demand semantics: a forced request must not silently
+        // become the other backend, while `auto` must never fail.
+        //
+        // On a host where the BPF map is actually available both calls
+        // succeed legitimately; the check that matters is that `eevdf`
+        // never *demotes* without saying so.
+        if let Ok(b) = select_backend(BackendSelection::Eevdf) {
+            // It was available — the forced request got exactly what it
+            // asked for, which is the same invariant expressed the other
+            // way round.
+            assert!(matches!(b, Backend::Eevdf(_)));
+        }
+        assert!(
+            select_backend(BackendSelection::Auto).is_ok(),
+            "auto must resolve to *some* actuator on any host"
+        );
+    }
 }
 
 /* ── main event loop ───────────────────────────────────────────────── */
@@ -618,13 +836,16 @@ fn main() -> Result<()> {
             return Err(e);
         }
     }));
+    /* The actuator already reported itself in `Animamap::open`; what is
+     * left to say is what was *asked* for, because that is the part the
+     * operator controls and the part that can be silently overridden. */
     eprintln!(
-        "[anima] boost backend: nice {} (ANIMA_BOOST_NICE, cgroup cpu.weight \
-         ANIMA_BOOST_CPU_WEIGHT)",
-        anima
-            .lock()
-            .map(|a| a.booster.boost_nice())
-            .unwrap_or(anima_boost::DEFAULT_BOOST_NICE)
+        "[anima] backend requested: {}",
+        match requested_backend() {
+            BackendSelection::Auto => "auto",
+            BackendSelection::Eevdf => "eevdf",
+            BackendSelection::Nice => "nice",
+        }
     );
 
     /* Browser-mode state: the active-tab PID reported by the WebExtension
