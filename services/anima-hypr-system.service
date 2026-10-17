@@ -1,14 +1,24 @@
 # SPDX-License-Identifier: GPL-2.0
 #
-# AnimAIOS Hyprland focus daemon (BORE/EEVDF boost) — system service
+# AnimAIOS Hyprland focus daemon (dual actuator backends) — system service
 #
-# Replaces `anima-hypr.service` (the user service) when the machine boots
-# a BORE-patched kernel. The user service's BPF-map pump had no consumer
-# there — `sched_ext` is `disabled`, and scx_lavd's pinned
-# `anima_active_pids` map is never created, so the daemon crash-looped
-# reading the missing pin. This unit runs the BORE backend instead, which
-# drives the scheduler through plain per-task syscalls and a
-# daemon-owned cgroup.
+# The daemon carries two interchangeable backends that drive the focused
+# window's PIDs, and picks one at startup:
+#
+#   1. EEVDF/BPF — writes PIDs into scx_lavd's pinned BPF maps
+#      (`anima_active_pids`, `anim` config) for the continuous 0..1024
+#      `lat_cri` scale. Used only when `sched_ext` is active and both
+#      pins open.
+#   2. NICE — `setpriority(2)` plus a daemon-owned cgroup's `cpu.weight`.
+#      Always available; the fallback.
+#
+# This unit starts the daemon as root, which is what the BORE/EEVDF path
+# needed: the user service's BPF-map pump had no consumer there —
+# `sched_ext` is `disabled` and scx_lavd's pinned `anima_active_pids`
+# map is never created, so the daemon crash-looped reading the missing
+# pin. That selection is now explicit and non-fatal: the startup probe
+# below sees the `disabled` state and the daemon runs the nice backend
+# instead, no CPU spent reading a pin nothing consumes.
 #
 # Why a system service (not the previous user service)?
 #   Raising a process's priority above the daemon's own nice requires
@@ -36,7 +46,7 @@
 # unavailable; it reports that and continues with nice-only writes.
 
 [Unit]
-Description=AnimAIOS Hyprland focus daemon — BORE/EEVDF boost for %i
+Description=AnimAIOS Hyprland focus daemon — BPF (sched_ext) or BORE/EEVDF boost for %i
 # Hyprland must own the socket the daemon subscribes to, and the session
 # it names must already exist.
 After=graphical-session.target hyprland-session.target
@@ -47,12 +57,27 @@ Type=simple
 # %i is the uid of the graphical session this unit serves.
 Environment=ANIMA_USER_UID=%i
 
+# Which actuator drives the boost. Vocabulary:
+#   auto  (default) — prefer scx_lavd's BPF maps when
+#          `/sys/kernel/sched_ext/state` is `enabled` AND both pins
+#          (`/sys/fs/bpf/anima_active_pids`, `/sys/fs/bpf/anim`) open;
+#          otherwise fall back to nice + cgroup `cpu.weight`.
+#   eevdf — force the BPF backend; exit with an explicit error if the
+#          probe fails (an explicit request is honoured, not silently
+#          overridden).
+#   nice  — force the nice backend; ignore `sched_ext` entirely.
+Environment=ANIMA_BACKEND=auto
+
 # Bridge Hyprland's IPC into a root daemon. A system unit cannot inherit
 # the session's environment, so the instance signature is read from the
 # session's socket directory at start time and written where the daemon
 # reads it. `Environment=` cannot do this — it takes no substitutions
 # from the filesystem — so the file below is the bridge.
 EnvironmentFile=/run/anima/hypr-env-%i.conf
+# TODO(env-bridge): the file above and the `ANIMA_BOOST_CGROUP` value it
+# feeds are under separate review (the Hyprland env bridge). Nothing
+# below changes their wiring; the backend selection introduced here only
+# decides which actuator consumes the same focus state.
 
 # Where the boost cgroup is created. Omitted, the daemon derives it from
 # its own `/proc/self/cgroup` and lands on the root slice when that
@@ -77,6 +102,15 @@ StartLimitBurst=10
 
 # Hardening. The daemon needs CAP_SYS_NICE to raise the focused process
 # and write to a cgroup; nothing else.
+#
+# The set below is the union the nice path requires: lowering *another*
+# task's priority needs CAP_SYS_NICE. The BPF path needs none of it —
+# writing a PID into a pinned map opened by its owner does not raise
+# anything. So `ANIMA_BACKEND=eevdf` alone would run with an empty
+# bounding set, while `ANIMA_BACKEND=nice` still needs CAP_SYS_NICE;
+# `auto` may legitimately need either, so the union stays as-is. A future
+# unit that pins one backend can trim the set without touching
+# ExecStart.
 NoNewPrivileges=no
 CapabilityBoundingSet=CAP_SYS_NICE CAP_CHOWN CAP_DAC_OVERRIDE
 ProtectSystem=full

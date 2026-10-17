@@ -46,8 +46,9 @@ Hyprland focus events
     ↓
 Rust userspace controller
     ↓
-per-task boost  ──→  sched_ext LAVD   (eBPF map)
-    ↓          └──→  BORE / EEVDF      (nice + cpu.weight)
+backend chosen at startup (ANIMA_BACKEND)
+    ├── scx_lavd loaded?  →  sched_ext LAVD   (eBPF map)
+    └── otherwise         →  BORE / EEVDF     (nice + cpu.weight)
     ↓
 CPU scheduling decisions
 ```
@@ -68,16 +69,17 @@ Firefox → Terminal → Game
 
 AnimaLAVD instantly updates the active PID list.
 
-The focused application receives a latency boost through the LAVD criticality system.
+The focused application receives a latency boost — through LAVD's
+criticality system when scx_lavd is loaded, and through `nice` plus a
+`cpu.weight` cgroup otherwise.
 
 No:
 
-* `nice`
-* `renice`
 * wrapper scripts
 * application-specific hacks
 
-The scheduler handles it directly.
+The scheduler handles it directly — LAVD reads the written `lat_cri`, the
+stock scheduler reads the nice and weight the daemon writes.
 
 ---
 
@@ -90,16 +92,68 @@ The scheduler handles it directly.
 * resolves window → PID mappings
 * drives the scheduler through per-task actuation
 
-Two backends, same focus/audio state, same incremental reconciliation:
+Two backends, same focus/audio state, same incremental reconciliation.
+Exactly one runs per startup: the daemon probes for `sched_ext` and picks
+(`auto` selects, see [Backend selection](#backend-selection)):
 
-| backend | scheduler | actuator | unit |
+|| backend | scheduler | actuator | unit |
 |---|---|---|---|
-| `scx_lavd-anima` | LAVD via `sched_ext` | pinned `anima_active_pids` BPF map, consulted in `lat_cri.bpf.c` | `anima-hypr.service` (user) |
-| BORE/EEVDF (default here) | stock CFS/EEVDF + BORE | `setpriority(2)` nice + a daemon-owned cgroup's `cpu.weight` | `anima-hypr-system.service` (root) |
+| EEVDF/BPF (`scx_lavd-anima`) | LAVD via `sched_ext` | PIDs written into pinned `anima_active_pids` / `anim` BPF maps, consulted in `lat_cri.bpf.c` | `anima-hypr.service` (user) |
+| NICE (BORE/EEVDF) | stock CFS/EEVDF + BORE | `setpriority(2)` nice + a daemon-owned cgroup's `cpu.weight` | `anima-hypr-system.service` (root) |
 
-The BORE backend needs no loaded scheduler and no pinned map: it writes
-knobs the kernel already reads. It does need `CAP_SYS_NICE` to raise the
-focused window above the daemon's own nice — hence the root system unit.
+How each boosts:
+
+- **EEVDF/BPF** — a continuous `lat_cri` in `0..1024` written per PID, so the focused task can be placed anywhere in LAVD's latency scale rather than only at its top; the granularity is fine, but the map only exists while scx_lavd is loaded and holds the pins.
+- **NICE** — `setpriority(2)` to `-10` plus a cgroup at `cpu.weight` 500, a coarse ladder that spans 40:1 in nice and needs weight to amplify; it is always available because it writes knobs the stock kernel already reads.
+
+The NICE backend needs no loaded scheduler and no pinned map. It does
+need `CAP_SYS_NICE` to raise the focused window above the daemon's own
+nice — hence the root system unit — while the BPF path needs no privilege
+beyond permission to open the pins its owner created.
+
+<a name="backend-selection"></a>
+
+### Backend selection
+
+`ANIMA_BACKEND` chooses which actuator drives the boost. It is read once
+at daemon start, never per focus event:
+
+|| value | probe result | behaviour |
+|---|---|---|
+| `auto` (default) | `sched_ext` `enabled` **and** both pins open | EEVDF/BPF backend |
+| `auto` (default) | anything else | NICE backend; the reason is logged once and the daemon continues |
+| `eevdf` | probe fails | explicit error and exit — an explicit request is honoured, not silently overridden |
+| `nice` | — | NICE backend, `sched_ext` is never consulted |
+
+The probe is the pair of conditions the BPF backend actually depends on:
+`/sys/kernel/sched_ext/state` must read `enabled` (a `disabled` or
+`disabling` state means no BPF scheduler is attached and no map consumer
+exists), and both `/sys/fs/bpf/anima_active_pids` and
+`/sys/fs/bpf/anim` must open for reading and writing. A stale pin left by
+a scheduler that has since unloaded is precisely what the state check
+rejects: writing to it is silently dropping the boost, which is why the
+pins are not opened when the state is not `enabled`. The probe reads no
+map contents and writes nothing, so it is safe without root and without
+scx_lavd running.
+
+Failure while running is never fatal either: if a BPF write fails
+mid-session (the scheduler unloaded under us), the daemon logs the exact
+error once, stops writing that map, and describes itself as degraded on
+its startup line.
+
+Boost tuning, alongside the existing:
+
+|| Variable | Default | Meaning |
+|---|---|---|
+| `ANIMA_BACKEND` | `auto` | `auto` \| `eevdf` \| `nice` |
+| `ANIMA_BOOST_NICE` | `-10` | NICE backend: nice level written for boosted PIDs (`-20..=19`) |
+| `ANIMA_BOOST_CPU_WEIGHT` | `500` | NICE backend: `cpu.weight` of the boost cgroup while active |
+| `ANIMA_BOOST_CGROUP` | derived | NICE backend: where the boost cgroup is created |
+
+Because of that selection the daemon can now start with no scx_lavd
+running and without root: the nice backend's cgroup half is optional and
+degrades to nice-only writes if the cgroup cannot be created or written,
+and the BPF backend activates only when its probe succeeds.
 
 Implementation:
 
@@ -143,8 +197,8 @@ Streams arrive as events rather than being polled, so focus and audio
 are tracked as **separate inputs** and a stream that starts or stops
 while you keep typing is picked up without a focus event. Audio and the
 focused window receive the *same* boost. If you want to reweight them,
-the lever is `ANIMA_BOOST_NICE`, which applies to all boosted PIDs
-alike.
+the lever is `ANIMA_BOOST_NICE` — on the NICE backend, where it applies to
+all boosted PIDs alike.
 
 A stream node does not carry its own PID: it only carries `client.id`,
 and the PID lives on the matching `PipeWire:Interface:Client` object as
@@ -278,8 +332,11 @@ Background tabs remain normal.
                     v
         anima-hypr-daemon (Rust)
                     |
+            backend selected at startup
+       (/sys/kernel/sched_ext/state + pins)
+                    |
         ┌───────────┴───────────┐
-        │                       │
+        │  one path is active  │
         v                       v
 pinned BPF maps            setpriority + cgroup
 (/sys/fs/bpf)              cpu.weight
@@ -305,12 +362,14 @@ The daemon answers one question the scheduler cannot:
 Is this PID currently user-focused?
 ```
 
-The answer is then applied with the levers that scheduler actually
-reads. Two backends:
+The answer is then applied with the levers the scheduler actually
+reads. Exactly one of the two actuators is active for a given run — which
+one is decided at startup by `ANIMA_BACKEND` (see
+[Backend selection](#backend-selection)):
 
-| backend | yes → effect |
+|| backend | yes → effect |
 |---|---|
-| LAVD (`sched_ext`) | `lat_cri` raised; the focused task enters LAVD's highest latency class (`ANIMA_BOOST`, default 896 = top 12.5%) |
+| LAVD (`sched_ext`) | `lat_cri` written to the pinned PID map; the focused task enters LAVD's highest latency class (default boost 896 = top 12.5% of the 0..1024 scale) |
 | BORE / EEVDF | `nice` lowered (default `ANIMA_BOOST_NICE=-10`) and the process moved into a cgroup at `cpu.weight` 500 (`ANIMA_BOOST_CPU_WEIGHT`) |
 
 Under BORE the nice write propagates into the weight itself:
@@ -377,6 +436,8 @@ If:
 * Hyprland stops
 * daemon exits
 * the boost cgroup is unavailable
+* scx_lavd unloads mid-session, so the BPF maps go away
+* the startup probe finds no `sched_ext` at all
 
 Every boost is released on exit (SIGTERM, SIGINT, crash, graceful), and
 the scheduler falls back to its own behavior. What is *not* released is
@@ -395,6 +456,7 @@ to exactly what ananicy had set rather than to 0.
 * [x] Window tree filtering
 * [x] PipeWire latency integration
 * [x] nice + `cpu.weight` boost backend (BORE / EEVDF)
+* [x] Runtime backend selection: BPF when `sched_ext` is active, with nice as the always-available fallback
 * [ ] Browser extension PID bridge
 * [ ] Game launcher integration
 * [ ] Per-application profiles
