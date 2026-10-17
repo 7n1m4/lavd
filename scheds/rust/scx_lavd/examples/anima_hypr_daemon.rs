@@ -7,15 +7,19 @@
 //! under load.
 //!
 //! Architecture (post-polish, see git log):
-//! - Direct bpf() syscalls via libbpf_rs::MapHandle — zero subprocesses
-//!   in the map-update path
-//! - Incremental map updates (only delete stale keys, insert new keys)
+//! - Per-task booster via `setpriority(2)` + a daemon-owned cgroup's
+//!   `cpu.weight` — the actuators that actually drive BORE/EEVDF. The
+//!   BPF-map path needed `scx_lavd`, and `sched_ext` is `disabled` on
+//!   BORE-patched kernels, so the map pump had no consumer. See
+//!   `anima_boost.rs`.
+//! - Incremental reconciliation: only the PIDs that gained or lost the
+//!   boost are touched; a repeated focus event costs nothing
 //! - PID cache: read `hyprctl clients -j` once at startup, no per-event
 //!   hyprctl calls in steady state
 //! - CPU-based child filter: in window+tree mode, direct children whose
 //!   CPU usage over the last sample window exceeds ANIMA_CHILD_MAX_CPU
 //!   (default 0.5) are excluded from the boost set
-//! - Signal handlers so the pinned map is wiped on exit/crash/SIGTERM
+//! - Signal handlers so every boost is released on exit/crash/SIGTERM
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -29,26 +33,13 @@ use anyhow::{Context, Result};
 
 mod anima_audio;
 use anima_audio::AudioEvent;
+mod anima_boost;
+use anima_boost::Booster;
 mod anima_swap;
 use anima_swap::SwapGuard;
-use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use scx_utils::anima_tab_sock;
 
-const MAP_PIN_PATH: &str = "/sys/fs/bpf/anima_active_pids";
-const CONFIG_PIN_PATH: &str = "/sys/fs/bpf/anima_config";
-
 /* ── tunable constants ─────────────────────────────────────────────── */
-
-/// Default focused-window latency-criticality boost. Matches the BPF
-/// default `LAVD_ANIMA_LC_BOOST_DFL`. Smaller = gentler. 0 = disable.
-const DEFAULT_BOOST: u32 = (1024 * 7) / 8; /* 896 = top 12.5% LC */
-
-/// Value written to the BPF map entry (`0x01` = active/focused).
-const MAP_ACTIVE_VALUE: u8 = 0x01;
-
-/// Maximum sensible boost value. Clamping prevents divide-by-zero in
-/// LAVD's deadline math and stops `dl_delta` from collapsing to ~0.
-const MAX_BOOST: u32 = 1024;
 
 /// Window+tree mode: a direct child using more than this fraction of
 /// a single CPU during the sample window is excluded. Set to 1.0 to
@@ -75,11 +66,9 @@ const SWAP_PROTECT_DEFAULT: &str = "on";
 
 /* ── data structures ───────────────────────────────────────────────── */
 
-/// PIDs in the BPF map + CPU accounting state for child-filtering.
+/// Per-task booster + CPU accounting state for child-filtering.
 struct Animamap {
-    handle: MapHandle,
-    config_handle: MapHandle,
-    last_keys: HashSet<u32>,
+    booster: Booster,
     cpu: CpuFilter,
     boost: BoostState,
     /// Live PipeWire stream count per PID. A PID holds the boost while it
@@ -134,38 +123,9 @@ impl BoostState {
     }
 }
 
-/// One reconciliation step: which keys to delete, which to write.
-///
-/// Pure (no syscalls) so the incremental-update logic can be tested
-/// without root privileges or a loaded scheduler — the real bug class
-/// here is "a key that stops being boosted is never deleted".
-struct MapDiff {
-    /// Keys present in `last` but not in `next` — must be deleted.
-    delete: Vec<u32>,
-    /// Keys in `next` that are not already in `last` — written in
-    /// ascending order for determinism. Keys retained from `last` skip
-    /// the write: nothing else mutates this map, so the entry is still
-    /// there and rewriting it on every focus event is pure syscall
-    /// amplification.
-    write: Vec<u32>,
-}
-
-impl MapDiff {
-    fn between(last: &HashSet<u32>, next: &HashSet<u32>) -> Self {
-        Self {
-            delete: {
-                let mut v: Vec<u32> = last.difference(next).copied().collect();
-                v.sort_unstable();
-                v
-            },
-            write: {
-                let mut v: Vec<u32> = next.difference(last).copied().collect();
-                v.sort_unstable();
-                v
-            },
-        }
-    }
-}
+/// Reconciliation is `anima_boost::BoostPlan` — the BPF `MapDiff` moved
+/// there with the actuator. Its diff/release invariants are tested in
+/// that module, where they no longer depend on root or a live scheduler.
 
 /// Fold one PipeWire stream event into the per-PID live-stream count.
 ///
@@ -188,25 +148,15 @@ fn adjust_refs(refs: &mut HashMap<u32, usize>, event: AudioEvent) {
 }
 
 impl Animamap {
-    /// Open the pinned BPF maps. `MapHandle::from_pinned_path` is the
-    /// canonical entry point in libbpf-rs 0.26.x for opening a pinned
-    /// BPF map by bpffs path. Requires `scx_lavd-anima` to be running
-    /// first (it does the pinning) — if the pin is missing this call
-    /// fails hard with a clear error instead of silently dropping
-    /// updates.
+    /// Build the booster and the child-CPU filter.
+    ///
+    /// No prerequisite daemon and no privileges: every actuator here is
+    /// a plain per-task syscall plus a daemon-owned cgroup write, so the
+    /// daemon starts whether or not `scx_lavd` is running. Failures
+    /// degrade to nice-only and are reported at the point they occur.
     fn open() -> Result<Self> {
-        let handle = MapHandle::from_pinned_path(MAP_PIN_PATH).with_context(|| {
-            format!("cannot open pinned BPF map at {MAP_PIN_PATH} — is scx_lavd-anima running?")
-        })?;
-        let config_handle = MapHandle::from_pinned_path(CONFIG_PIN_PATH)
-            .with_context(|| format!(
-                "cannot open pinned BPF config map at {CONFIG_PIN_PATH} — is scx_lavd-anima running?"
-            ))?;
-
         Ok(Self {
-            handle,
-            config_handle,
-            last_keys: HashSet::with_capacity(16),
+            booster: Booster::from_env(),
             cpu: CpuFilter::new(
                 DEFAULT_CHILD_MAX_CPU,
                 Duration::from_millis(DEFAULT_SAMPLE_MILLIS),
@@ -214,17 +164,6 @@ impl Animamap {
             boost: BoostState::default(),
             audio_refs: HashMap::with_capacity(8),
         })
-    }
-
-    /// Write the boost level into the BPF config map once at startup.
-    /// Clamped to `[0, MAX_BOOST]`. A failed write is non-fatal — the
-    /// BPF default still applies.
-    fn set_boost(&self, boost: u32) -> Result<()> {
-        let clamped = std::cmp::min(boost, MAX_BOOST);
-        self.config_handle
-            .update(&0u32.to_le_bytes(), &clamped.to_le_bytes(), MapFlags::ANY)
-            .with_context(|| format!("failed to update anima_config[{clamped}]"))?;
-        Ok(())
     }
 
     /// Browser-mode update: boost only the focused PID and the PID of the
@@ -243,11 +182,14 @@ impl Animamap {
         Ok(())
     }
 
-    /// Push the focused PID (and optionally its direct children) into
-    /// the map. Incremental: only deletes stale keys + inserts new keys.
-    /// Also unions the current set of audio-PIDs so that any process
-    /// driving a PulseAudio/PipeWire sink-input gets the boost even if
-    /// it is not focused (e.g. Spotify while you type in a terminal).
+    /// Boost the focused PID (and optionally its direct children), then
+    /// reconcile against the union of focus and audio state.
+    ///
+    /// Only the PIDs that gained or lost the boost are touched, so a
+    /// repeated focus event is a no-op. Also unions the current set of
+    /// audio-PIDs so that any process driving a PipeWire sink-input
+    /// gets the boost even if it is not focused (e.g. Spotify while you
+    /// type in a terminal).
     fn update_focused(&mut self, focused_pid: u32, include_children: bool) -> Result<()> {
         let mut base_keys: HashSet<u32> = HashSet::with_capacity(8);
         base_keys.insert(focused_pid);
@@ -264,8 +206,7 @@ impl Animamap {
     }
 
     /// Apply one PipeWire registry event: add or drop one audio-PID and
-    /// reconcile the map immediately, without waiting for a Hyprland focus
-    /// event.
+    /// reconcile immediately, without waiting for a Hyprland focus event.
     ///
     /// Events are reference-counted per PID because a process can own more
     /// than one playback stream (a game with music and a voice client, a
@@ -285,48 +226,26 @@ impl Animamap {
         self.update_audio(pids)
     }
 
-    /// Update audio-PIDs and reconcile the map immediately, without
-    /// waiting for a Hyprland focus event.
+    /// Update audio-PIDs and reconcile immediately, without waiting for a
+    /// Hyprland focus event.
     fn update_audio(&mut self, audio_pids: HashSet<u32>) -> Result<()> {
         let new_keys = self.boost.set_audio_pids(audio_pids).clone();
         self.apply_active_keys(&new_keys)
     }
 
+    /// Reconcile the booster against the desired PID set.
+    ///
+    /// The booster owns the diff and the baselines; this is the single
+    /// write path, so both a focus event and an audio event converge.
     fn apply_active_keys(&mut self, new_keys: &HashSet<u32>) -> Result<()> {
-        let diff = MapDiff::between(&self.last_keys, new_keys);
-        for stale in &diff.delete {
-            if let Err(e) = self.handle.delete(&stale.to_le_bytes()) {
-                eprintln!("[anima] delete pid {stale}: {e}");
-            }
-        }
-
-        for key in &diff.write {
-            if let Err(e) =
-                self.handle
-                    .update(&key.to_le_bytes(), &[MAP_ACTIVE_VALUE], MapFlags::ANY)
-            {
-                return Err(anyhow::anyhow!("insert pid {key}: {e}"));
-            }
-        }
-
-        self.last_keys = new_keys.clone();
+        self.booster.reconcile(new_keys);
         Ok(())
     }
 
-    /// Clear every entry in the pinned map. Called on SIGINT/SIGTERM and
-    /// on graceful exit so no stale PID keeps boosting.
+    /// Release every boost. Called on SIGINT/SIGTERM and on graceful
+    /// exit so no PID stays boosted after the daemon is gone.
     fn clear(&mut self) -> Result<()> {
-        let keys: Vec<_> = self.handle.keys().collect();
-        let n = keys.len();
-        for key in &keys {
-            if key.len() == 4 {
-                if let Err(e) = self.handle.delete(key) {
-                    eprintln!("[anima] clear delete: {e}");
-                }
-            }
-        }
-        self.last_keys.clear();
-        eprintln!("[anima] cleared {n} stale entries");
+        self.booster.release_all();
         Ok(())
     }
 }
@@ -556,33 +475,12 @@ mod tests {
         assert_eq!(active, pids(&[100, 200, 300]));
     }
 
-    /* ── reconciliation: the incremental map update ─────────────────── */
+    /* ── reconciliation: the incremental boost update ───────────────── */
 
-    /// A PID that stops being boosted must be deleted, not just left in
-    /// the map. This is the failure that leaves a stale boost forever.
-    #[test]
-    fn reconciliation_deletes_keys_that_stop_being_boosted() {
-        let last = pids(&[100, 200]);
-        let next = pids(&[100, 300]);
-
-        let diff = MapDiff::between(&last, &next);
-
-        assert_eq!(diff.delete, vec![200]);
-        // 100 is already in the map, so only 300 is written.
-        assert_eq!(diff.write, vec![300]);
-    }
-
-    /// A pure repeat must not touch the map at all — the whole point of
-    /// the incremental design.
-    #[test]
-    fn reconciliation_is_a_noop_when_the_set_is_unchanged() {
-        let set = pids(&[100, 200]);
-
-        let diff = MapDiff::between(&set, &set);
-
-        assert!(diff.delete.is_empty());
-        assert!(diff.write.is_empty());
-    }
+    /// Reconciliation itself — the release-on-demote and no-op-on-repeat
+    /// invariants — now lives in `anima_boost`, whose `BoostPlan` is the
+    /// same diff with syscalls attached. What is left here is the
+    /// *composition*: audio and focus state converging into one set.
 
     /// Audio PID boosting an unfocused process, then focus moving on:
     /// both the focus and the audio key have to survive until each one
@@ -601,18 +499,6 @@ mod tests {
         // The audio key must still be there.
         let active = state.set_base_keys(HashSet::new()).clone();
         assert_eq!(active, pids(&[300]));
-    }
-
-    /// Keys are 32-bit little-endian on the wire; make sure the sort
-    /// order is over the numeric value, not the byte order.
-    #[test]
-    fn reconciliation_writes_in_ascending_pid_order() {
-        let last = HashSet::new();
-        let next = pids(&[217300, 12, 3]);
-
-        let diff = MapDiff::between(&last, &next);
-
-        assert_eq!(diff.write, vec![3, 12, 217300]);
     }
 
     /* ── PipeWire event ref-counting ───────────────────────────────── */
@@ -695,13 +581,11 @@ fn main() -> Result<()> {
      * contained — an unusable cgroup leaves the window swappable, which is
      * the pre-existing behaviour, not a regression.
      *
-     * Deliberately first, BEFORE the pinned BPF maps are opened: swap
-     * protection is a userspace cgroup concern and needs no scheduler or
-     * root, while the boost path needs both. Initialising the swapguard
-     * after the map open would mean a missing pin (scheduler not loaded)
-     * also silently skips swap protection, which makes the two features
-     * fail together for reasons that have nothing to do with each other.
-     * It must never gate the boost path either. */
+     * Deliberately first: swap protection is a userspace cgroup concern
+     * that needs no privileges at all, while the boost path needs
+     * CAP_SYS_NICE to raise the focused window. Initialising the
+     * swapguard after the boost would couple two features that have
+     * nothing to do with each other. */
     let swapguard: Mutex<SwapGuard> = Mutex::new(SwapGuard::from_env());
     let swapguard = Arc::new(swapguard);
     let swapguard_on_signal = Arc::clone(&swapguard);
@@ -715,38 +599,33 @@ fn main() -> Result<()> {
         SWAP_PROTECT_DEFAULT
     );
 
+    /* The boost backend needs no pinned map, no loaded scheduler and no
+     * root to *start*: it builds its cgroup if it may and reports
+     * otherwise, then degrades to nice-only. Raising a process above its
+     * caller's own nice does need CAP_SYS_NICE — see
+     * `anima-hypr-system.service`. */
     let anima = Arc::new(Mutex::new(match Animamap::open() {
         Ok(a) => a,
         Err(e) => {
-            /* The boost path needs root and a running scheduler; swap
-             * protection needs neither. Tearing the pool down here keeps a
-             * missing pin from leaking cgroups, which would otherwise sit
-             * in the user slice holding a `memory.swap.max=0` that nothing
-             * is using — and, worse, still holding whatever process was
-             * last moved into a slot. */
+            /* Keep the teardown of an unrelated feature out of the boost
+             * path's failure handling; but a swap pool armed before a
+             * doomed start would still leak its cgroups, so it is torn
+             * down here on the one path that can still fail. */
             if let Ok(mut sg) = swapguard.lock() {
                 sg.clear();
                 sg.teardown();
             }
-            return Err(e).with_context(|| {
-                "Cannot open pinned map — is scx_lavd-anima running and pinning \
-                 /sys/fs/bpf/anima_active_pids?"
-            });
+            return Err(e);
         }
     }));
-
-    /* Tunables from environment. */
-    let boost = std::env::var("ANIMA_BOOST")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_BOOST);
-    {
-        let g = anima.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        match g.set_boost(boost) {
-            Ok(()) => eprintln!("[anima] boost set to {}", boost.min(MAX_BOOST)),
-            Err(e) => eprintln!("[anima] set_boost({boost}) failed: {e}"),
-        }
-    }
+    eprintln!(
+        "[anima] boost backend: nice {} (ANIMA_BOOST_NICE, cgroup cpu.weight \
+         ANIMA_BOOST_CPU_WEIGHT)",
+        anima
+            .lock()
+            .map(|a| a.booster.boost_nice())
+            .unwrap_or(anima_boost::DEFAULT_BOOST_NICE)
+    );
 
     /* Browser-mode state: the active-tab PID reported by the WebExtension
      * via a UNIX stream socket at `/run/anima/tab.sock`. The PID is
@@ -834,10 +713,15 @@ fn main() -> Result<()> {
         .unwrap_or_default();
     eprintln!("[anima] PID cache: {} entries", pid_cache.len());
 
-    /* SIGINT/SIGTERM → wipe map then exit. */
+    /* SIGINT/SIGTERM → release every boost then exit. */
     let anima_on_signal = Arc::clone(&anima);
+    let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutting_down_in_signal = Arc::clone(&shutting_down);
     ctrlc::set_handler(move || {
-        eprintln!("[anima] shutdown signal — clearing map");
+        /* Set first, so a focus event already in flight drains instead of
+         * re-boosting a PID the release below is letting go. */
+        shutting_down_in_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[anima] shutdown signal — releasing boosts");
         if let Ok(mut g) = anima_on_signal.lock() {
             let _ = g.clear();
         }
@@ -882,19 +766,26 @@ fn main() -> Result<()> {
             .unwrap_or(false);
 
         let mut g = anima.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        if let (true, Some(tab_pid)) = (is_browser, tab_pid) {
-            if let Err(e) = g.update_browser(pid, tab_pid) {
-                eprintln!("[anima] update_browser: {e}");
+        /* Not while shutting down. The signal handler releases every boost
+         * under the same mutex, so an event processed concurrently would
+         * re-boost a PID the handler has just released and the daemon
+         * would exit having left one process stranded. Draining this event
+         * instead costs nothing: shutdown already releases everything. */
+        if !shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+            if let (true, Some(tab_pid)) = (is_browser, tab_pid) {
+                if let Err(e) = g.update_browser(pid, tab_pid) {
+                    eprintln!("[anima] update_browser: {e}");
+                }
+            } else if let Err(e) = g.update_focused(pid, include_children) {
+                eprintln!("[anima] update_focused: {e}");
             }
-        } else if let Err(e) = g.update_focused(pid, include_children) {
-            eprintln!("[anima] update_focused: {e}");
         }
         drop(g);
 
         /* Swap protection last, and after the boost path has already run
          * to completion: it is the only step here that can fail without
          * costing anything, so it must never be able to interrupt the
-         * map update above. A poisoning guard is recovered from rather
+         * boost above. A poisoning guard is recovered from rather
          * than propagated for the same reason — swap protection that
          * took down the daemon would be strictly worse than none.
          *
