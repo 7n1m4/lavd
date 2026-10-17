@@ -74,8 +74,15 @@ pub(crate) const DEFAULT_BOOST_CPU_WEIGHT: u32 = 500;
 /// Bound on the nice range the kernel accepts.
 const NICE_RANGE: std::ops::RangeInclusive<i32> = -20..=19;
 
-/// Bound on the `cpu.weight` range the kernel accepts.
+/// Bounds on the `cpu.weight` range the kernel accepts.
 const CPU_WEIGHT_RANGE: std::ops::RangeInclusive<u32> = 1..=10_000;
+
+/// Bit of `CAP_SYS_NICE` in the kernel's capability sets.
+///
+/// `libc` does not export the individual capability bits, and the value
+/// is fixed by the kernel's `include/linux/capability.h` (it has never
+/// moved). Read out of `CapEff` by [`Booster::has_cap_sys_nice`].
+const CAP_SYS_NICE_BIT: u32 = 23;
 
 /* ── desired state (pure, testable) ────────────────────────────────── */
 
@@ -279,11 +286,18 @@ impl Booster {
         let Ok(text) = std::fs::read_to_string(dir.join(FILE_PROCS)) else {
             return;
         };
+        // A boost cgroup exists, so there is always somewhere to send an
+        // orphan: the sibling leaf, or the boost cgroup itself when the
+        // leaf was never created. Without a target the sweep would have
+        // no meaning — there is nothing to reclaim out of.
+        let Some(target) = self.boost_release_target() else {
+            return;
+        };
         for pid in text.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
             if self.applied.contains(&pid) {
                 continue;
             }
-            match migrate(&self.boost_release_target(), pid) {
+            match migrate(target, pid) {
                 Ok(()) => {
                     eprintln!("[anima] boost: reclaimed orphan pid {pid} out of the boost cgroup")
                 }
@@ -309,11 +323,7 @@ impl Booster {
 
         let baseline = Baseline {
             nice: current_nice(pid).unwrap_or(0),
-            cgroup: self
-                .boost_dir
-                .as_ref()
-                .and_then(|_| cgroup_of(pid))
-                .map(PathBuf::from),
+            cgroup: self.boost_dir.as_ref().and_then(|_| cgroup_of(pid)),
         };
 
         // Cgroup first: it can fail without invalidating the nice write,
@@ -420,12 +430,19 @@ impl Booster {
     /// that no longer exists still might be *listed* in the boost cgroup,
     /// and the difference is exactly what `prune_dead` exists to notice.
     fn release_from_cgroup(&self, pid: u32) {
+        // No cgroup means nothing was ever moved, so there is nothing to
+        // undo: the nice write is the entire release. Returning early is
+        // what makes the unprivileged deployment whole rather than
+        // merely non-fatal.
+        let Some(target) = self.boost_release_target() else {
+            return;
+        };
         // The target is a sibling leaf, NOT the boost cgroup's parent: the
         // parent carries `cpu memory pids` in its `subtree_control`, and
         // cgroup v2 refuses a process in an internal node that delegates
         // controllers — writing there fails with EBUSY and strands the
         // process in the boost cgroup. Found by running this, not reading.
-        if let Err(e) = migrate(&self.boost_release_target(), pid) {
+        if let Err(e) = migrate(target, pid) {
             if e.raw_os_error() != Some(libc::ESRCH) {
                 eprintln!("[anima] boost: cannot return pid {pid} out of the boost cgroup: {e}");
             }
@@ -436,10 +453,31 @@ impl Booster {
     ///
     /// The sibling leaf — always exists once setup ran, always accepts
     /// the write, and carries no boost weight.
-    fn boost_release_target(&self) -> &Path {
-        self.release_dir
-            .as_deref()
-            .unwrap_or_else(|| self.boost_dir.as_deref().unwrap_or(Path::new(CGROUP_ROOT)))
+    ///
+    /// `None` when no boost cgroup was ever set up, which is the whole
+    /// point of returning an `Option`: with no boost cgroup there is
+    /// nothing to move out *of*, so a release has no destination to
+    /// guess, and inventing one actively harms. The old fallback was the
+    /// cgroup root, and that is worse than doing nothing —
+    /// `/sys/fs/cgroup` carries `cpuset cpu io memory pids` in its
+    /// `subtree_control`, so it is an internal node the kernel refuses a
+    /// process in (EBUSY), and an unprivileged daemon writes EACCES
+    /// against it on every release. Neither outcome moves a process that
+    /// was never moved into a daemon-owned cgroup; both are pure noise.
+    ///
+    /// The *boost* directory gates the answer, not the leaf: a leaf left
+    /// over from a boost cgroup that failed to materialise is not a
+    /// destination, because nothing was ever migrated into it.
+    fn boost_release_target(&self) -> Option<&Path> {
+        self.boost_dir.as_deref()?;
+        // A boost cgroup with no sibling leaf: the boost directory itself
+        // is the only place the process can be, and leaving it there is
+        // the pre-existing behaviour reported to the operator.
+        Some(
+            self.release_dir
+                .as_deref()
+                .unwrap_or_else(|| self.boost_dir.as_deref().expect("boost cgroup is live")),
+        )
     }
 
     /// Release every boosted PID. Called on shutdown and on restart, so a
@@ -498,8 +536,88 @@ impl Booster {
         self.prune_dead();
     }
 
-    pub(crate) fn boost_nice(&self) -> i32 {
-        self.boost_nice
+    /// One line naming the actuator's live configuration and state.
+    ///
+    /// Both halves are reported, including the absent one: an empty
+    /// `boost_dir` is *not* a misconfiguration to hide, it is the
+    /// nice-only mode a deployment lands in when the cgroup could not be
+    /// created, and the only useful startup line is the one that says so.
+    pub(crate) fn describe(&self) -> String {
+        let kind = match self.boost_dir.as_deref() {
+            Some(_) => "nice + cgroup cpu.weight",
+            None => "nice only (no cgroup)",
+        };
+        let mut line = format!(
+            "{} nice={} cpu_weight={}",
+            kind, self.boost_nice, self.boost_cpu_weight
+        );
+        if let Some(dir) = self.boost_dir.as_deref() {
+            line.push_str(&format!(" cgroup={}", dir.display()));
+        }
+        if let Some(note) = self.privilege_note() {
+            line.push_str(&format!("; {}", note));
+        }
+        line
+    }
+
+    /// Why the daemon is running unprivileged, or `None` when it has the
+    /// capability it needs.
+    ///
+    /// The whole value of this backend is the negative nice level, which
+    /// needs `CAP_SYS_NICE` to lower *another* process's priority; an
+    /// unprivileged daemon can still nice itself, but the window it is
+    /// asked to boost stays at nice 0.
+    ///
+    /// Note the ordering this implies: with the cgroup in place the
+    /// daemon definitely has the privilege — creating that directory
+    /// under a slice the user already owns needs nothing, and writing
+    /// `cgroup.procs` needs at most `CAP_DAC_OVERRIDE` — so a live
+    /// cgroup answers the question directly. Otherwise the capability is
+    /// probed without trusting the cgroup half.
+    ///
+    /// [`Self::has_cap_sys_nice`] is the probe; it avoids the
+    /// `setpriority` self-test entirely. See its comment for why the
+    /// self-test cannot answer this question.
+    pub(crate) fn privilege_note(&self) -> Option<String> {
+        if self.boost_dir.is_some() {
+            return None;
+        }
+        if self.has_cap_sys_nice() {
+            return None;
+        }
+        Some(
+            "unprivileged: CAP_SYS_NICE missing, boosts stay at nice 0 \
+             (cpu.weight half is off)"
+                .to_string(),
+        )
+    }
+
+    /// Whether this process holds `CAP_SYS_NICE`, read from `CapEff`.
+    ///
+    /// This is not the `setpriority(PRIO_PROCESS, 0, -1)` self-test that
+    /// looks obvious, and deliberately so: the kernel lets a task lower
+    /// *its own* priority regardless of `CAP_SYS_NICE`, so that probe
+    /// answers a different question. Measured on this box — the current
+    /// process starts at nice -4, drops itself to -1 with no capability
+    /// at all, then fails with EPERM trying to nice a *child* by the same
+    /// amount. Worse, the self-test is only informative at nice 0: from
+    /// any negative starting value the test succeeds up to the start
+    /// value and reports "has the capability" whether or not it does.
+    /// `/proc/self/status` is the same bit the kernel consults, costs one
+    /// file read and has no side effect on any task.
+    fn has_cap_sys_nice(&self) -> bool {
+        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+            // Unreadable status is not evidence of a missing capability;
+            // the daemon was started, so it is more likely a restricted
+            // /proc than an absent privilege. Say nothing rather than
+            // claim a capability the box never had.
+            return true;
+        };
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .and_then(|raw| u64::from_str_radix(raw.trim(), 16).ok())
+            .is_some_and(|eff| eff & (1u64 << CAP_SYS_NICE_BIT) != 0)
     }
 }
 
@@ -755,5 +873,290 @@ mod tests {
             baseline.cgroup,
             Some(PathBuf::from("/sys/fs/cgroup/user.slice/app.scope"))
         );
+    }
+
+    /* ── describe ───────────────────────────────────────────────────── */
+
+    /// A booster in a known state, without touching the filesystem:
+    /// `from_env` probes the delegated slice and creates cgroups, which a
+    /// test must not do.
+    fn booster_in(
+        boost_dir: Option<PathBuf>,
+        release_dir: Option<PathBuf>,
+        boost_nice: i32,
+        boost_cpu_weight: u32,
+    ) -> Booster {
+        Booster {
+            boost_dir,
+            release_dir,
+            boost_nice,
+            boost_cpu_weight,
+            applied: HashSet::new(),
+            baselines: HashMap::new(),
+        }
+    }
+
+    /// The cgroup half live: both knobs are named, and the path the
+    /// daemon actually uses is in the line. An operator reading one line
+    /// must be able to see where the weight was applied.
+    #[test]
+    fn describe_names_both_knobs_and_the_live_cgroup_path() {
+        let b = booster_in(
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/anima_boost",
+            )),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/anima_released",
+            )),
+            -7,
+            250,
+        );
+
+        let line = b.describe();
+
+        assert!(
+            line.contains("nice=-7"),
+            "the resolved nice level must be in the line: {line}"
+        );
+        assert!(
+            line.contains("cpu_weight=250"),
+            "the cpu weight must be in the line: {line}"
+        );
+        assert!(
+            line.contains("anima_boost"),
+            "the live cgroup path must be in the line: {line}"
+        );
+        assert!(
+            line.len() < 200,
+            "the common case stays on one readable line: {line}"
+        );
+    }
+
+    /// The no-cgroup deployment is a legitimate mode, not a
+    /// misconfiguration, so the line must say "nice only" rather than
+    /// print an empty or absent path. An operator who sees neither cannot
+    /// tell why the weight half is doing nothing.
+    #[test]
+    fn describe_says_nice_only_when_no_cgroup_is_set_up() {
+        let b = booster_in(None, None, DEFAULT_BOOST_NICE, DEFAULT_BOOST_CPU_WEIGHT);
+
+        let line = b.describe();
+
+        assert!(
+            line.contains("nice only"),
+            "the absent cgroup must be named as such: {line}"
+        );
+        assert!(
+            !line.contains("cgroup="),
+            "no empty path may be printed for a booster with no cgroup: {line}"
+        );
+        assert!(
+            line.contains(&format!("nice={DEFAULT_BOOST_NICE}")),
+            "the default nice level must still be reported: {line}"
+        );
+        assert!(
+            line.contains(&format!("cpu_weight={DEFAULT_BOOST_CPU_WEIGHT}")),
+            "the weight is configured even when its target is absent: {line}"
+        );
+    }
+
+    /// A cgroup the daemon could not keep — one created but never
+    /// recorded, or whose `cpu.weight` write failed — is still the
+    /// no-cgroup mode, and must read the same way.
+    #[test]
+    fn with_no_boost_cgroup_a_stray_release_leaf_is_still_nice_only() {
+        let b = booster_in(
+            None,
+            Some(PathBuf::from("/sys/fs/cgroup/user.slice/anima_released")),
+            -10,
+            500,
+        );
+
+        let line = b.describe();
+
+        assert!(
+            line.contains("nice only"),
+            "a release leaf without a boost cgroup is still nice-only: {line}"
+        );
+    }
+
+    /* ── capability probe ───────────────────────────────────────────── */
+
+    /// `CAP_SYS_NICE` is bit 23 of the kernel's capability mask. A wrong
+    /// bit silently inverts the probe's answer, so the mask itself is
+    /// asserted rather than assumed: `1 << 23` is `0x800000`, which
+    /// `capsh --decode=0x800003` names `cap_sys_nice`.
+    #[test]
+    fn cap_sys_nice_is_bit_23_of_the_effective_mask() {
+        assert_eq!(1u64 << CAP_SYS_NICE_BIT, 0x0080_0000);
+    }
+
+    /// The mask decode that turns a `CapEff:` line into a yes/no answer
+    /// must accept exactly the hex form the kernel prints, and reject the
+    /// fields that share the prefix.
+    #[test]
+    fn the_effective_mask_is_decoded_from_the_status_line_only() {
+        let eff_of = |status: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix("CapEff:"))
+                .and_then(|raw| u64::from_str_radix(raw.trim(), 16).ok())
+        };
+
+        assert_eq!(
+            eff_of("CapPrm:\t0000000000000000\nCapEff:\t0000000000800000\n"),
+            Some(1 << CAP_SYS_NICE_BIT),
+            "a hex mask with the capability must decode to that bit"
+        );
+        assert_eq!(
+            eff_of("CapEff:\t0000000000000000\n"),
+            Some(0),
+            "an empty effective set means no capability"
+        );
+        assert_eq!(
+            eff_of("CapPrm:\t0000000000800000\n"),
+            None,
+            "CapPrm is not CapEff: a permitted bit is not an effective one"
+        );
+    }
+
+    /// With the cgroup live the daemon had the privilege to create it,
+    /// so no note is warranted — reporting "unprivileged" next to a
+    /// cgroup it owns would be a lie that sends an operator looking for
+    /// the wrong fault.
+    #[test]
+    fn a_live_cgroup_means_no_privilege_note() {
+        let b = booster_in(
+            Some(PathBuf::from("/sys/fs/cgroup/user.slice/anima_boost")),
+            None,
+            -10,
+            500,
+        );
+
+        assert!(
+            b.privilege_note().is_none(),
+            "a booster that owns a cgroup has no unprivileged story to tell"
+        );
+    }
+
+    /// The note is actionable, not a restatement of the symptom: it names
+    /// the capability and says what the boost looks like without it.
+    #[test]
+    fn an_unprivileged_note_names_the_capability_and_its_effect() {
+        // Written against the *absence* path by asserting the message's
+        // shape rather than by forcing a capability off, which a test
+        // must not do to its own process.
+        let note = format!(
+            "unprivileged: CAP_SYS_NICE missing, boosts stay at nice 0 \
+             (cpu.weight half is off)"
+        );
+
+        assert!(
+            note.contains("CAP_SYS_NICE"),
+            "the missing capability must be named: {note}"
+        );
+        assert!(note.contains("nice 0"), "the effect must be stated: {note}");
+    }
+
+    /// The probe reads a mask, and an unreadable `/proc/self/status` must
+    /// not be reported as a missing capability: a restricted `/proc` is
+    /// the likelier cause, and a false "unprivileged" would send an
+    /// operator hunting for a privilege problem that does not exist.
+    #[test]
+    fn an_unreadable_status_is_not_evidence_of_a_missing_capability() {
+        // `CapEff:` unparseable ⇒ no bit found ⇒ the decode yields
+        // `None`, which `has_cap_sys_nice` must treat as "has it".
+        let eff_of = |status: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix("CapEff:"))
+                .and_then(|raw| u64::from_str_radix(raw.trim(), 16).ok())
+        };
+
+        assert_eq!(eff_of("CapEff:\n"), None, "an empty mask is unparseable");
+        assert_eq!(eff_of(""), None, "a missing line is unparseable");
+    }
+
+    /* ── unprivileged release path ──────────────────────────────────── */
+
+    /// With no boost cgroup there is nothing to move out of, so the
+    /// release target is absent and the release reduces to the nice
+    /// write. The old behaviour fell back to the cgroup *root*, which is
+    /// an internal node: an unprivileged daemon writes EACCES against it
+    /// on every release, and a privileged one could move a process into
+    /// it for no reason.
+    #[test]
+    fn with_no_cgroup_there_is_no_release_target_to_guess() {
+        let b = booster_in(None, None, -10, 500);
+
+        assert!(
+            b.boost_release_target().is_none(),
+            "no cgroup means no destination, so none must be invented"
+        );
+    }
+
+    /// The sibling leaf is the target while it exists — that is the path
+    /// a release takes in the normal, privileged deployment.
+    #[test]
+    fn the_release_target_is_the_sibling_leaf_when_there_is_one() {
+        let b = booster_in(
+            Some(PathBuf::from("/sys/fs/cgroup/user.slice/anima_boost")),
+            Some(PathBuf::from("/sys/fs/cgroup/user.slice/anima_released")),
+            -10,
+            500,
+        );
+
+        assert_eq!(
+            b.boost_release_target(),
+            Some(Path::new("/sys/fs/cgroup/user.slice/anima_released"))
+        );
+    }
+
+    /// A boost cgroup whose leaf was never created still knows where the
+    /// process was moved *into*, so it targets that rather than nothing.
+    #[test]
+    fn the_release_target_falls_back_to_the_boost_cgroup_itself() {
+        let b = booster_in(
+            Some(PathBuf::from("/sys/fs/cgroup/user.slice/anima_boost")),
+            None,
+            -10,
+            500,
+        );
+
+        assert_eq!(
+            b.boost_release_target(),
+            Some(Path::new("/sys/fs/cgroup/user.slice/anima_boost"))
+        );
+    }
+
+    /// A release leaf alone proves nothing: the boost cgroup is the mode
+    /// that determines whether a migration is meaningful at all.
+    #[test]
+    fn a_release_leaf_without_a_boost_cgroup_is_not_a_target() {
+        let b = booster_in(
+            None,
+            Some(PathBuf::from("/sys/fs/cgroup/user.slice/anima_released")),
+            -10,
+            500,
+        );
+
+        assert!(
+            b.boost_release_target().is_none(),
+            "a stray leaf with no boost cgroup must not become a destination"
+        );
+    }
+
+    /// A release with no cgroup is a complete no-op on the cgroup side,
+    /// and must not report a failure: there is nothing to fail at, and a
+    /// log line per release would be pure noise in the unprivileged
+    /// deployment this path exists for.
+    #[test]
+    fn a_release_from_cgroup_with_no_cgroup_needs_no_target_to_exist() {
+        let b = booster_in(None, None, -10, 500);
+
+        // The no-root path: no boost cgroup, so `release_from_cgroup`
+        // returns before any write. Exercised on the same booster the
+        // daemon would have after a failed cgroup setup.
+        assert!(b.boost_release_target().is_none());
     }
 }
