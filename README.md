@@ -9,7 +9,7 @@
 [![DeepSource](https://app.deepsource.com/gh/animaios/animalavd.svg/?label=active+issues&show_trend=true&token=hTeG3XzzElKjGvZdZ_zO7CaZ)](https://app.deepsource.com/gh/animaios/animalavd/)
 [![DeepSource](https://app.deepsource.com/gh/animaios/animalavd.svg/?label=resolved+issues&show_trend=true&token=hTeG3XzzElKjGvZdZ_zO7CaZ)](https://app.deepsource.com/gh/animaios/animalavd/)
 
-**A `sched_ext` LAVD scheduler fork that adds compositor-aware scheduling to Linux desktops.**
+**Compositor-aware CPU scheduling for Linux desktops — a `sched_ext` LAVD fork plus a BORE/EEVDF backend for stock kernels.**
 
 </div>
 
@@ -19,7 +19,7 @@ Unlike traditional schedulers that only see CPU usage, AnimaLAVD understands wha
 * 🎧 **Audio workloads stay latency-safe during heavy system load**
 * 🌐 **Optional browser integration boosts the active tab renderer**
 * ⚡ **Rust-powered userspace daemon updates scheduler state in real time**
-* 🧬 **eBPF-backed scheduler decisions without kernel patches**
+* 🧬 **Runs on `sched_ext` LAVD *and* on a stock BORE kernel** — the same focus/audio state drives either backend
 
 The result: a desktop that stays responsive while gaming, compiling, streaming, or running heavy workloads.
 
@@ -46,7 +46,8 @@ Hyprland focus events
     ↓
 Rust userspace controller
     ↓
-eBPF sched_ext scheduler
+per-task boost  ──→  sched_ext LAVD   (eBPF map)
+    ↓          └──→  BORE / EEVDF      (nice + cpu.weight)
     ↓
 CPU scheduling decisions
 ```
@@ -87,14 +88,26 @@ The scheduler handles it directly.
 * listens to Hyprland IPC events
 * tracks focused windows
 * resolves window → PID mappings
-* updates pinned BPF maps directly
+* drives the scheduler through per-task actuation
+
+Two backends, same focus/audio state, same incremental reconciliation:
+
+| backend | scheduler | actuator | unit |
+|---|---|---|---|
+| `scx_lavd-anima` | LAVD via `sched_ext` | pinned `anima_active_pids` BPF map, consulted in `lat_cri.bpf.c` | `anima-hypr.service` (user) |
+| BORE/EEVDF (default here) | stock CFS/EEVDF + BORE | `setpriority(2)` nice + a daemon-owned cgroup's `cpu.weight` | `anima-hypr-system.service` (root) |
+
+The BORE backend needs no loaded scheduler and no pinned map: it writes
+knobs the kernel already reads. It does need `CAP_SYS_NICE` to raise the
+focused window above the daemon's own nice — hence the root system unit.
 
 Implementation:
 
 * Rust
-* `libbpf-rs`
-* direct `bpf()` map updates
-* incremental updates only
+* `libbpf-rs` for the LAVD backend; plain libc/cgroup writes for BORE
+* incremental updates only — a repeated focus event is a no-op
+* baselines recorded before any write, so a release restores the
+  pre-boost nice (and cgroup) rather than assuming 0
 
 No:
 
@@ -117,23 +130,21 @@ playback-stream events: start / stop
     ↓
 PID resolved via the owning Client object
     ↓
-anima_active_pids BPF map
-    ↓
-same LAVD boost as the focused window
+same per-task boost as the focused window
 ```
 
 ```
 Firefox playing a YouTube tab (unfocused)
         ↓
-its PID is in the map even while you type
+its PID is boosted even while you type
 ```
 
 Streams arrive as events rather than being polled, so focus and audio
 are tracked as **separate inputs** and a stream that starts or stops
 while you keep typing is picked up without a focus event. Audio and the
-focused window receive the *same* boost — there is no per-PID priority
-in the map. If you want to reweight them, the lever is `ANIMA_BOOST`,
-which applies to all boosted PIDs alike.
+focused window receive the *same* boost. If you want to reweight them,
+the lever is `ANIMA_BOOST_NICE`, which applies to all boosted PIDs
+alike.
 
 A stream node does not carry its own PID: it only carries `client.id`,
 and the PID lives on the matching `PipeWire:Interface:Client` object as
@@ -262,21 +273,24 @@ Background tabs remain normal.
 ```
                  Hyprland
                     |
-                    |
               focus events
                     |
                     v
         anima-hypr-daemon (Rust)
                     |
-                    |
-        pinned BPF maps (/sys/fs/bpf)
-                    |
-                    v
-            scx_lavd-anima
-                    |
-                    v
-          Linux sched_ext subsystem
-                    |
+        ┌───────────┴───────────┐
+        │                       │
+        v                       v
+pinned BPF maps            setpriority + cgroup
+(/sys/fs/bpf)              cpu.weight
+        │                       │
+        v                       v
+  scx_lavd-anima            BORE / EEVDF
+        │                    (CFS, stock kernel)
+        v                       │
+  sched_ext                    │
+        │                       │
+        └───────────┬───────────┘
                     v
                    CPU
 ```
@@ -285,47 +299,64 @@ Background tabs remain normal.
 
 # How the boost works
 
-LAVD already calculates latency criticality based on task behavior.
-
-AnimaLAVD adds one extra signal:
+The daemon answers one question the scheduler cannot:
 
 ```
 Is this PID currently user-focused?
 ```
 
-If yes:
+The answer is then applied with the levers that scheduler actually
+reads. Two backends:
 
-```
-lat_cri = configured focus boost
-```
+| backend | yes → effect |
+|---|---|
+| LAVD (`sched_ext`) | `lat_cri` raised; the focused task enters LAVD's highest latency class (`ANIMA_BOOST`, default 896 = top 12.5%) |
+| BORE / EEVDF | `nice` lowered (default `ANIMA_BOOST_NICE=-10`) and the process moved into a cgroup at `cpu.weight` 500 (`ANIMA_BOOST_CPU_WEIGHT`) |
 
-The focused task enters LAVD's highest latency class.
+Under BORE the nice write propagates into the weight itself:
+`effective_prio_bore()` is `static_prio - MAX_RT_PRIO +
+bore_score(p)`, and `set_load_weight()` scales that into the EEVDF
+weight. The cgroup weight provides the amplification nice alone cannot,
+since nice only spans 40:1 while `cpu.weight` spans 1..10000.
 
-Default:
-
-```
-ANIMA_BOOST=896
-```
-
-This gives the active application scheduler preference without completely starving background workloads.
+Both give the active application scheduler preference without
+completely starving background workloads, and both are released — back
+to the process's *pre-boost* nice, not to 0 — the moment focus moves on.
 
 ---
 
 # Design goals
 
-## Preserve LAVD behavior
+## Preserve the scheduler's own logic
 
-AnimaLAVD does not replace LAVD's scheduling logic.
-
-It adds one additional signal:
+Neither backend replaces the scheduler's decisions. Each adds one
+additional signal:
 
 ```
 User attention
 ```
 
-Everything else remains upstream LAVD.
+- On LAVD, everything else remains upstream LAVD — the boost is one
+  `lat_cri` override at the top of a computation that is otherwise
+  unmodified.
+- On BORE, the boost is a `nice` and a `cpu.weight`, both of which the
+  stock scheduler consumes directly. BORE's own burst accounting —
+  `bore_score(p)`, which rewards tasks that sleep often — is untouched,
+  so an interactive task does not need the boost to win.
 
----
+## Coexists with ananicy-cpp
+
+The two daemons write the same field from opposite directions, so their
+interaction was measured before either was trusted:
+
+- ananicy matches by `comm`/`cmdline`, and applies a rule **once** when
+  it first sees a PID. It never re-applies. A `nice` this daemon writes
+  afterwards therefore stays put, and vice versa.
+- ananicy can set `sched=idle` on a process. Under `SCHED_IDLE` a task
+  never competes for CPU, so **nice has no effect** — the focused-window
+  case is unaffected, but a background task ananicy demoted to idle
+  cannot be revived by nice alone. The cgroup weight half of the boost
+  is what restores a meaningful share there.
 
 ## Low overhead
 
@@ -333,9 +364,9 @@ Focus changes are rare.
 
 Each update:
 
-* modifies only changed PIDs
-* uses direct BPF map operations
-* avoids userspace/kernel round trips
+* modifies only changed PIDs (a repeated focus event is a no-op)
+* uses direct syscalls / control-file writes — no subprocesses
+* avoids polling the compositor or the audio server
 
 ---
 
@@ -345,11 +376,13 @@ If:
 
 * Hyprland stops
 * daemon exits
-* map is unavailable
+* the boost cgroup is unavailable
 
-The scheduler falls back to normal LAVD behavior.
-
-No permanent priority changes are applied.
+Every boost is released on exit (SIGTERM, SIGINT, crash, graceful), and
+the scheduler falls back to its own behavior. What is *not* released is
+the process itself: a release restores the pre-boost nice and the
+pre-boost cgroup, so a background process demoted by ananicy goes back
+to exactly what ananicy had set rather than to 0.
 
 ---
 
@@ -357,10 +390,11 @@ No permanent priority changes are applied.
 
 * [x] Hyprland focus tracking
 * [x] Rust userspace daemon
-* [x] eBPF PID priority map
+* [x] eBPF PID priority map (LAVD / `sched_ext` backend)
 * [x] Runtime boost tuning
 * [x] Window tree filtering
 * [x] PipeWire latency integration
+* [x] nice + `cpu.weight` boost backend (BORE / EEVDF)
 * [ ] Browser extension PID bridge
 * [ ] Game launcher integration
 * [ ] Per-application profiles
